@@ -136,7 +136,7 @@ declare module 'fuse-native' {
             buffer: Buffer,
             length: number,
             position: number,
-            cb: (bytesRead: number | number) => void
+            cb: (bytesRead: number) => void
         ) => void;
 
         write?: (
@@ -145,7 +145,7 @@ declare module 'fuse-native' {
             buffer: Buffer,
             length: number,
             position: number,
-            cb: (written: number | number) => void
+            cb: (written: number) => void
         ) => void;
 
         release?: (
