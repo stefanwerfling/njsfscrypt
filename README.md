@@ -1,4 +1,7 @@
-# njsfscrypt
+# NjsFsCrypt
+
+<img src="doc/images/njsfscrypt.png" width="230">
+
 A tool for fuse file crypt
 
 # Important
