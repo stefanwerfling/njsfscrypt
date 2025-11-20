@@ -1,14 +1,19 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import {Readable, Writable} from 'node:stream';
+import {promisify} from 'node:util';
 import * as path from 'path';
 import * as fuse from 'node-fuse-bindings';
+import {pipeline} from 'stream';
+
+const pipe = promisify(pipeline);
 
 /**
  * EncryptedFS
  */
 export class EncryptedFS {
 
-    public static BLOCK_SIZE = 4 * 1024 * 1024;
+    public static BLOCK_SIZE = 128 * 1024 * 1024;
 
     /**
      * Key
@@ -35,30 +40,47 @@ export class EncryptedFS {
         this.key = key ?? crypto.randomBytes(32);
     }
 
-    private encrypt(data: Buffer): Buffer {
+    private async encryptBlockStream(data: Buffer): Promise<Buffer> {
         const iv = crypto.randomBytes(12);
         const cipher = crypto.createCipheriv('aes-256-gcm', this.key, iv);
-        const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
+
+        const input = Readable.from(data);
+        const chunks: Buffer[] = [];
+        const output = new Writable({
+            write: (chunk, _, cb): void => {
+                chunks.push(Buffer.from(chunk));
+                cb();
+            }
+        });
+
+        await pipe(input, cipher, output);
+        const encrypted = Buffer.concat(chunks);
         const tag = cipher.getAuthTag();
-        return Buffer.concat([iv, tag, encrypted]) as Buffer;
+        return Buffer.concat([iv, tag, encrypted]);
     }
 
-    private decrypt(data: Buffer): Buffer {
+    private async decryptBlockStream(data: Buffer): Promise<Buffer> {
         if (data.length < 28) {
-            throw new Error('Data too short to decrypt (needs at least 28 bytes)');
+            throw new Error('Data too short');
         }
 
-        const iv = data.subarray(0, 12);
-        const tag = data.subarray(12, 28);
+        const iv = data.subarray(0,12);
+        const tag = data.subarray(12,28);
         const encrypted = data.subarray(28);
         const decipher = crypto.createDecipheriv('aes-256-gcm', this.key, iv);
-
         decipher.setAuthTag(tag);
 
-        return Buffer.concat([
-            decipher.update(encrypted) as Buffer,
-            decipher.final() as Buffer
-        ]) as Buffer;
+        const input = Readable.from(encrypted);
+        const chunks: Buffer[] = [];
+        const output = new Writable({
+            write: (chunk, _, cb): void => {
+                chunks.push(Buffer.from(chunk));
+                cb();
+            }
+        });
+
+        await pipe(input, decipher, output);
+        return Buffer.concat(chunks);
     }
 
     private encodeName(name: string): string {
@@ -145,7 +167,7 @@ export class EncryptedFS {
             open: (p, flags, cb) => cb(0, 42),
 
             // eslint-disable-next-line consistent-return
-            read: (p, fd, buf, len, pos, cb) => {
+            read: async(p, fd, buf, len, pos, cb) => {
                 const fullPath = this.mapPath(p);
 
                 if (!fs.existsSync(fullPath)) {
@@ -168,7 +190,7 @@ export class EncryptedFS {
                         break;
                     }
 
-                    const decrypted = this.decrypt(rawBlock.subarray(0, n));
+                    const decrypted = await this.decryptBlockStream(rawBlock.subarray(0, n));
                     const slice = decrypted.subarray(blockOffset, blockOffset + toRead);
                     slice.copy(result, bytesRead);
 
@@ -182,7 +204,7 @@ export class EncryptedFS {
                 cb(bytesRead);
             },
 
-            write: (p, fd, buf, len, pos, cb) => {
+            write: async(p, fd, buf, len, pos, cb) => {
                 const fullPath = this.mapPath(p);
                 const fdStorage = fs.openSync(fullPath, 'r+');
 
@@ -200,14 +222,14 @@ export class EncryptedFS {
                     try {
                         const n = fs.readSync(fdStorage, rawBlock, 0, rawBlock.length, blockPos);
                         if (n > 0) {
-                            decrypted = this.decrypt(rawBlock.subarray(0, n));
+                            decrypted = await this.decryptBlockStream(rawBlock.subarray(0, n));
                         }
                     } catch {
                         console.log(`Error write ${fullPath}`);
                     }
 
                     buf.subarray(bytesWritten, bytesWritten + toWrite).copy(decrypted, blockOffset);
-                    const encryptedBlock = this.encrypt(decrypted);
+                    const encryptedBlock = await this.encryptBlockStream(decrypted);
 
                     fs.writeSync(fdStorage, encryptedBlock, 0, encryptedBlock.length, blockPos);
                     bytesWritten += toWrite;
@@ -222,7 +244,7 @@ export class EncryptedFS {
             create: (p, mode, cb) => {
                 const fullPath = this.mapPath(p);
 
-                fs.writeFileSync(fullPath, this.encrypt(Buffer.alloc(0)));
+                this.encryptBlockStream(Buffer.alloc(0)).then(enc => fs.writeFileSync(fullPath, enc));
 
                 cb(0);
             },
