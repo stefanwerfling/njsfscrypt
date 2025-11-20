@@ -1,0 +1,27 @@
+{
+  "name": "njsfscrypt",
+  "version": "1.0.0",
+  "description": "A tool for fuse file crypt",
+  "main": "dist/main.js",
+  "type": "module",
+  "scripts": {
+    "npm-check-updates": "npm-check-updates",
+    "tsc": "tsc",
+    "build": "npm run tsc"
+  },
+  "keywords": [],
+  "author": "Stefan Werfling",
+  "license": "GPL-3.0-or-later",
+  "devDependencies": {
+    "@types/node": "^20.19.25",
+    "@typescript-eslint/eslint-plugin": "^7.4.0",
+    "@typescript-eslint/parser": "^7.4.0",
+    "eslint": "^8.46.0",
+    "eslint-plugin-jest": "^28.8.0",
+    "eslint-plugin-prefer-arrow": "^1.2.3",
+    "typescript": "^5.7.3"
+  },
+  "dependencies": {
+    "node-fuse-bindings": "git+https://github.com/asivery/node-fuse-bindings.git"
+  }
+}
