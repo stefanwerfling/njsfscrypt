@@ -1,19 +1,16 @@
 import * as crypto from 'crypto';
-import * as fs from 'fs';
-import {Readable, Writable} from 'node:stream';
-import {promisify} from 'node:util';
+import * as fs from 'fs/promises';
+import Fuse from 'fuse-native';
 import * as path from 'path';
-import * as fuse from 'node-fuse-bindings';
-import {pipeline} from 'stream';
-
-const pipe = promisify(pipeline);
 
 /**
  * EncryptedFS
  */
 export class EncryptedFS {
 
-    public static BLOCK_SIZE = 128 * 1024 * 1024;
+    public static BLOCK_SIZE = 64 * 1024;
+    private static readonly HEADER_SIZE = 12 + 16;
+    private static readonly META_SIZE = 8;
 
     /**
      * Key
@@ -33,6 +30,13 @@ export class EncryptedFS {
      */
     private readonly mountPath: string;
 
+    /**
+     * File handles
+     * @protected
+     */
+    protected _handleCache = new Map<number, fs.FileHandle>();
+    private _nextHandle = 100;
+
     public constructor(storagePath: string, mountPath: string, key?: Buffer) {
         this.storagePath = storagePath;
         this.mountPath = mountPath;
@@ -40,47 +44,48 @@ export class EncryptedFS {
         this.key = key ?? crypto.randomBytes(32);
     }
 
-    private async encryptBlockStream(data: Buffer): Promise<Buffer> {
+    private async encryptBlock(plain: Buffer): Promise<Buffer> {
         const iv = crypto.randomBytes(12);
         const cipher = crypto.createCipheriv('aes-256-gcm', this.key, iv);
-
-        const input = Readable.from(data);
-        const chunks: Buffer[] = [];
-        const output = new Writable({
-            write: (chunk, _, cb): void => {
-                chunks.push(Buffer.from(chunk));
-                cb();
-            }
-        });
-
-        await pipe(input, cipher, output);
-        const encrypted = Buffer.concat(chunks);
+        const ct1 = cipher.update(plain);
+        const ct2 = cipher.final();
         const tag = cipher.getAuthTag();
-        return Buffer.concat([iv, tag, encrypted]);
+
+        const outLen = EncryptedFS.HEADER_SIZE + ct1.length + ct2.length;
+        const out = Buffer.allocUnsafe(outLen);
+        let off = 0;
+
+        iv.copy(out, off); off += 12;
+        tag.copy(out, off); off += 16;
+        ct1.copy(out, off); off += ct1.length;
+
+        if (ct2.length) {
+            ct2.copy(out, off);
+        }
+
+        return out;
     }
 
-    private async decryptBlockStream(data: Buffer): Promise<Buffer> {
-        if (data.length < 28) {
+    private async decryptBlock(enc: Buffer): Promise<Buffer> {
+        if (enc.length < EncryptedFS.HEADER_SIZE) {
             throw new Error('Data too short');
         }
 
-        const iv = data.subarray(0,12);
-        const tag = data.subarray(12,28);
-        const encrypted = data.subarray(28);
+        const iv = enc.subarray(0, 12);
+        const tag = enc.subarray(12, 28);
+        const ciphertext = enc.subarray(28);
         const decipher = crypto.createDecipheriv('aes-256-gcm', this.key, iv);
+
         decipher.setAuthTag(tag);
 
-        const input = Readable.from(encrypted);
-        const chunks: Buffer[] = [];
-        const output = new Writable({
-            write: (chunk, _, cb): void => {
-                chunks.push(Buffer.from(chunk));
-                cb();
-            }
-        });
+        const p1 = decipher.update(ciphertext);
+        const p2 = decipher.final();
 
-        await pipe(input, decipher, output);
-        return Buffer.concat(chunks);
+        if (p2.length) {
+            return Buffer.concat([p1, p2]);
+        }
+
+        return p1;
     }
 
     private encodeName(name: string): string {
@@ -112,148 +117,263 @@ export class EncryptedFS {
     }
 
     public mount(): void {
-        fuse.mount(this.mountPath, {
-            // eslint-disable-next-line consistent-return
-            readdir: (p, cb) => {
-                const fullPath = path.join(this.storagePath, p);
+        const fuse = new Fuse(this.mountPath, {
+            readdir: async(p, cb): Promise<void> => {
+                const fullPath = p === '/' ? this.storagePath : this.mapPath(p);
 
-                if (!fs.existsSync(fullPath)) {
-                    return cb(-2, []);
-                }
-
-                const files = fs.readdirSync(fullPath).map(fn => {
-                    try {
-                        return this.decodeName(fn);
-                    } catch {
-                        return '???';
-                    }
-                });
-
-                cb(0, files);
-            },
-
-            getattr: (p, cb) => {
-                const fullPath = this.mapPath(p);
-
-                if (p === '/') {
-                    return cb(0, {
-                        mtime: new Date(),
-                        atime: new Date(),
-                        ctime: new Date(),
-                        size: 4096,
-                        mode: 0o040755,
-                        uid: process.getuid?.() ?? 0,
-                        gid: process.getgid?.() ?? 0
-                    } as any);
-                }
-
-                if (!fs.existsSync(fullPath)) {
-                    return cb(-2);
-                }
-
-                const stat = fs.statSync(fullPath);
-
-                return cb(0, {
-                    mtime: stat.mtime,
-                    atime: stat.atime,
-                    ctime: stat.ctime,
-                    size: stat.size,
-                    mode: 0o100644,
-                    uid: stat.uid,
-                    gid: stat.gid
-                } as any);
-            },
-
-            open: (p, flags, cb) => cb(0, 42),
-
-            // eslint-disable-next-line consistent-return
-            read: async(p, fd, buf, len, pos, cb) => {
-                const fullPath = this.mapPath(p);
-
-                if (!fs.existsSync(fullPath)) {
-                    return cb(0);
-                }
-
-                const fdStorage = fs.openSync(fullPath, 'r');
-                const result = Buffer.alloc(len);
-                let bytesRead = 0;
-                let blockIndex = Math.floor(pos / EncryptedFS.BLOCK_SIZE);
-                let blockOffset = pos % EncryptedFS.BLOCK_SIZE;
-
-                while (bytesRead < len) {
-                    const blockPos = blockIndex * (EncryptedFS.BLOCK_SIZE + 28);
-                    const toRead = Math.min(EncryptedFS.BLOCK_SIZE, len - bytesRead);
-                    const rawBlock = Buffer.alloc(EncryptedFS.BLOCK_SIZE + 28);
-                    const n = fs.readSync(fdStorage, rawBlock, 0, rawBlock.length, blockPos);
-
-                    if (n === 0) {
-                        break;
-                    }
-
-                    const decrypted = await this.decryptBlockStream(rawBlock.subarray(0, n));
-                    const slice = decrypted.subarray(blockOffset, blockOffset + toRead);
-                    slice.copy(result, bytesRead);
-
-                    bytesRead += slice.length;
-                    blockIndex++;
-                    blockOffset = 0;
-                }
-
-                fs.closeSync(fdStorage);
-                result.copy(buf, 0);
-                cb(bytesRead);
-            },
-
-            write: async(p, fd, buf, len, pos, cb) => {
-                const fullPath = this.mapPath(p);
-                const fdStorage = fs.openSync(fullPath, 'r+');
-
-                let bytesWritten = 0;
-                let blockIndex = Math.floor(pos / EncryptedFS.BLOCK_SIZE);
-                let blockOffset = pos % EncryptedFS.BLOCK_SIZE;
-
-                while (bytesWritten < len) {
-                    const blockPos = blockIndex * (EncryptedFS.BLOCK_SIZE + 28);
-                    const toWrite = Math.min(EncryptedFS.BLOCK_SIZE - blockOffset, len - bytesWritten);
-                    const rawBlock = Buffer.alloc(EncryptedFS.BLOCK_SIZE + 28);
-
-                    let decrypted: Buffer = Buffer.alloc(EncryptedFS.BLOCK_SIZE);
-
-                    try {
-                        const n = fs.readSync(fdStorage, rawBlock, 0, rawBlock.length, blockPos);
-                        if (n > 0) {
-                            decrypted = await this.decryptBlockStream(rawBlock.subarray(0, n));
+                try {
+                    const files = (await fs.readdir(fullPath)).map((fn) => {
+                        try {
+                            return this.decodeName(fn);
+                        } catch {
+                            return '???';
                         }
-                    } catch {
-                        console.log(`Error write ${fullPath}`);
+                    });
+
+                    cb(0, files);
+                } catch {
+                    cb(-2, []);
+                }
+            },
+
+            getattr: async(p, cb): Promise<void> => {
+                const fullPath = p === '/' ? this.storagePath : this.mapPath(p);
+
+                try {
+                    const stat = await fs.stat(fullPath);
+
+                    if (stat.isDirectory()) {
+                        cb(0, {
+                            mtime: stat.mtime,
+                            atime: stat.atime,
+                            ctime: stat.ctime,
+                            size: stat.size,
+                            mode: 0o040755,
+                            uid: stat.uid,
+                            gid: stat.gid
+                        } as any);
+
+                        return;
                     }
 
-                    buf.subarray(bytesWritten, bytesWritten + toWrite).copy(decrypted, blockOffset);
-                    const encryptedBlock = await this.encryptBlockStream(decrypted);
+                    let fileSize = 0;
 
-                    fs.writeSync(fdStorage, encryptedBlock, 0, encryptedBlock.length, blockPos);
-                    bytesWritten += toWrite;
-                    blockIndex++;
-                    blockOffset = 0;
+                    if (stat.size >= EncryptedFS.META_SIZE) {
+                        const fh = await fs.open(fullPath, 'r');
+                        const b = Buffer.alloc(8);
+                        await fh.read(b, 0, 8, 0);
+                        await fh.close();
+
+                        fileSize = Number(b.readBigInt64BE(0));
+                    }
+
+                    cb(0, {
+                        mtime: stat.mtime,
+                        atime: stat.atime,
+                        ctime: stat.ctime,
+                        size: fileSize,
+                        mode: 0o100644,
+                        uid: stat.uid,
+                        gid: stat.gid
+                    } as any);
+
+                } catch {
+                    cb(-2, undefined);
+                }
+            },
+
+            /**
+             * Open
+             * @param {string} openPath
+             * @param {number} flags
+             * @param {(code: number, fd: number) => void} cb
+             */
+            open: async(
+                openPath: string,
+                flags: number,
+                cb: (code: number, fd: number) => void
+            ): Promise<void> => {
+                try {
+                    const fullPath = this.mapPath(openPath);
+                    const fh = await fs.open(fullPath, flags);
+                    const id = this._nextHandle++;
+
+                    this._handleCache.set(id, fh);
+
+                    cb(0, id);
+                } catch (e) {
+                    console.error('OPEN ERROR', e);
+                    cb(-1, 0);
+                }
+            },
+
+            read: async(p, fd, buf, len, pos, cb): Promise<void> => {
+                const fh = this._handleCache.get(fd);
+
+                if (!fh) {
+                    cb(0);
+                    return;
                 }
 
-                fs.closeSync(fdStorage);
-                cb(len);
+                try {
+                    const sizeBuf = Buffer.alloc(8);
+                    await fh.read(sizeBuf, 0, 8, 0);
+                    const fileSize = Number(sizeBuf.readBigInt64BE(0));
+
+                    if (pos >= fileSize) {
+                        cb(0);
+                        return;
+                    }
+
+                    const toReadTotal = Math.min(len, fileSize - pos);
+                    let done = 0;
+
+                    while (done < toReadTotal) {
+                        const blockIndex = Math.floor((pos + done) / EncryptedFS.BLOCK_SIZE);
+                        const blockOffset = (pos + done) % EncryptedFS.BLOCK_SIZE;
+
+                        let blockStart = EncryptedFS.META_SIZE;
+
+                        for (let i = 0; i < blockIndex; i++) {
+                            const hdr = Buffer.alloc(4);
+                            await fh.read(hdr, 0, 4, blockStart);
+                            const ctLen = hdr.readUInt32BE(0);
+                            blockStart += 4 + EncryptedFS.HEADER_SIZE + ctLen;
+                        }
+
+                        const hdr = Buffer.alloc(4);
+                        const { bytesRead: hbytes } = await fh.read(hdr, 0, 4, blockStart);
+                        if (hbytes !== 4) {
+                            break;
+                        }
+
+                        const ctLen = hdr.readUInt32BE(0);
+                        const enc = Buffer.alloc(ctLen + EncryptedFS.HEADER_SIZE);
+                        await fh.read(enc, 0, enc.length, blockStart + 4);
+
+                        const dec = await this.decryptBlock(enc);
+
+                        const toCopy = Math.min(
+                            dec.length - blockOffset,
+                            toReadTotal - done
+                        );
+
+                        dec.subarray(blockOffset, blockOffset + toCopy)
+                        .copy(buf, done);
+
+                        done += toCopy;
+                    }
+
+                    cb(done);
+
+                } catch(e) {
+                    console.error('READ ERROR', e);
+                    cb(0);
+                }
             },
 
-            create: (p, mode, cb) => {
-                const fullPath = this.mapPath(p);
+            write: async(_p, fd, buf, len, pos, cb): Promise<void> => {
+                const fh = this._handleCache.get(fd);
+                if (!fh) {
+                    cb(0);
+                    return;
+                }
 
-                this.encryptBlockStream(Buffer.alloc(0)).then(enc => fs.writeFileSync(fullPath, enc));
+                try {
+                    // fileSize lesen
+                    const sizeBuf = Buffer.alloc(8);
+                    await fh.read(sizeBuf, 0, 8, 0);
+                    let fileSize = Number(sizeBuf.readBigInt64BE(0));
 
-                cb(0);
+                    const endPos = pos + len;
+
+                    if (endPos > fileSize) {
+                        fileSize = endPos;
+                    }
+
+                    let bytesWritten = 0;
+
+                    while (bytesWritten < len) {
+                        const blockIndex = Math.floor((pos + bytesWritten) / EncryptedFS.BLOCK_SIZE);
+                        const blockOffset = (pos + bytesWritten) % EncryptedFS.BLOCK_SIZE;
+
+                        const toWrite = Math.min(
+                            EncryptedFS.BLOCK_SIZE - blockOffset,
+                            len - bytesWritten
+                        );
+
+                        let blockStart = EncryptedFS.META_SIZE;
+
+                        for (let i = 0; i < blockIndex; i++) {
+                            const hdr = Buffer.alloc(4);
+                            await fh.read(hdr, 0, 4, blockStart);
+                            const ctLen = hdr.readUInt32BE(0);
+                            blockStart += 4 + EncryptedFS.HEADER_SIZE + ctLen;
+                        }
+
+                        const hdr = Buffer.alloc(4);
+                        const { bytesRead: hbytes } = await fh.read(hdr, 0, 4, blockStart);
+
+                        const plain = Buffer.alloc(EncryptedFS.BLOCK_SIZE, 0);
+
+                        if (hbytes === 4) {
+                            const ctLen = hdr.readUInt32BE(0);
+                            const enc = Buffer.alloc(ctLen + EncryptedFS.HEADER_SIZE);
+                            await fh.read(enc, 0, enc.length, blockStart + 4);
+                            const dec = await this.decryptBlock(enc);
+                            dec.copy(plain, 0);
+                        }
+
+                        buf.subarray(bytesWritten, bytesWritten + toWrite).copy(plain, blockOffset);
+
+                        const enc = await this.encryptBlock(
+                            plain.subarray(0, Math.max(blockOffset + toWrite))
+                        );
+
+                        const lenBuf = Buffer.alloc(4);
+                        lenBuf.writeUInt32BE(enc.length - EncryptedFS.HEADER_SIZE);
+
+                        await fh.write(lenBuf, 0, 4, blockStart);
+                        await fh.write(enc, 0, enc.length, blockStart + 4);
+
+                        bytesWritten += toWrite;
+                    }
+
+                    sizeBuf.writeBigInt64BE(BigInt(fileSize));
+                    await fh.write(sizeBuf, 0, 8, 0);
+
+                    cb(len);
+
+                } catch(e) {
+                    console.error('WRITE ERROR', e);
+                    cb(0);
+                }
             },
 
-            unlink: (p, cb) => {
+            create: async(p, mode, cb): Promise<void> => {
+                try {
+                    const fullPath = this.mapPath(p);
+                    const fh = await fs.open(fullPath, 'w+');
+
+                    const sizeBuf = Buffer.alloc(8);
+                    sizeBuf.writeBigInt64BE(0n);
+                    await fh.write(sizeBuf, 0, 8, 0);
+
+                    const handle = this._nextHandle++;
+                    this._handleCache.set(handle, fh);
+
+                    cb(0, handle);
+                } catch(e) {
+                    console.error('CREATE ERROR', e);
+                    cb(-1, 0);
+                }
+            },
+
+            unlink: async(p, cb): Promise<void> => {
                 const fullPath = this.mapPath(p);
 
                 try {
-                    fs.unlinkSync(fullPath);
+                    await fs.unlink(fullPath);
                 } catch {
                     console.log(`Error unlink ${fullPath}`);
                 }
@@ -261,11 +381,11 @@ export class EncryptedFS {
                 cb(0);
             },
 
-            mkdir: (p, mode, cb) => {
+            mkdir: async(p, mode, cb): Promise<void> => {
                 const fullPath = this.mapPath(p);
 
                 try {
-                    fs.mkdirSync(fullPath, { mode: mode });
+                    await fs.mkdir(fullPath, {mode: mode});
                 } catch {
                     console.log(`Error mkdir ${fullPath}`);
                 }
@@ -273,11 +393,11 @@ export class EncryptedFS {
                 cb(0);
             },
 
-            rmdir: (p, cb) => {
+            rmdir: async(p, cb): Promise<void> => {
                 const fullPath = this.mapPath(p);
 
                 try {
-                    fs.rmdirSync(fullPath);
+                    await fs.rmdir(fullPath);
                 } catch {
                     console.log(`Error rmdir ${fullPath}`);
                 }
@@ -285,34 +405,46 @@ export class EncryptedFS {
                 cb(0);
             },
 
-            rename: (src, dest, cb) => {
+            rename: async(src, dest, cb): Promise<void> => {
                 const fullSrc = this.mapPath(src);
                 const fullDest = this.mapPath(dest);
 
                 try {
-                    fs.renameSync(fullSrc, fullDest);
+                    await fs.rename(fullSrc, fullDest);
                 } catch {
                     console.log(`Error rename ${fullSrc} -> ${fullDest}`);
                 }
 
                 cb(0);
-            }
+            },
 
-        }, (err?: number) => {
+            release: async(_path, fd, cb): Promise<void> => {
+                const fh = this._handleCache.get(fd);
+
+                if (fh) {
+                    await fh.close();
+                    this._handleCache.delete(fd);
+                }
+
+                cb(0);
+            }
+        }, { force: true, debug: false });
+
+        fuse.mount(err => {
             if (err) {
-                console.error('Mount failed:', err);
+                console.error('Mount failed', err);
             } else {
                 console.log('Mounted', this.mountPath);
             }
         });
 
-        process.on('SIGINT', () => this.unmount());
+        process.on('SIGINT', () => this.unmount(fuse));
     }
 
-    public unmount(): void {
-        fuse.unmount(this.mountPath, (err?: number) => {
+    public unmount(fuse?: Fuse): void {
+        fuse?.unmount(err => {
             if (err) {
-                console.error('Unmount failed:', err);
+                console.error('Unmount failed', err);
             } else {
                 console.log('Unmounted', this.mountPath);
             }
