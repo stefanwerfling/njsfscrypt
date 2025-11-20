@@ -9,8 +9,9 @@ import * as path from 'path';
 export class EncryptedFS {
 
     public static BLOCK_SIZE = 64 * 1024;
-    private static readonly HEADER_SIZE = 12 + 16;
-    private static readonly META_SIZE = 8;
+    private static readonly AES_BLOCK = 16;
+    private static readonly NONCE_SIZE = 16;
+    private static readonly META_SIZE = 8 + EncryptedFS.NONCE_SIZE;
 
     /**
      * Key
@@ -37,55 +38,32 @@ export class EncryptedFS {
     protected _handleCache = new Map<number, fs.FileHandle>();
     private _nextHandle = 100;
 
-    public constructor(storagePath: string, mountPath: string, key?: Buffer) {
+    public constructor(storagePath: string, mountPath: string, key: Buffer) {
         this.storagePath = storagePath;
         this.mountPath = mountPath;
-        // AES-256
-        this.key = key ?? crypto.randomBytes(32);
+        this.key = key;
     }
 
-    private async encryptBlock(plain: Buffer): Promise<Buffer> {
-        const iv = crypto.randomBytes(12);
-        const cipher = crypto.createCipheriv('aes-256-gcm', this.key, iv);
-        const ct1 = cipher.update(plain);
-        const ct2 = cipher.final();
-        const tag = cipher.getAuthTag();
+    private deriveCounterIV(nonce: Buffer, blockCounter: bigint): Buffer {
+        const iv = Buffer.from(nonce);
+        const last = iv.readBigUInt64BE(8);
+        const sum = last + blockCounter;
 
-        const outLen = EncryptedFS.HEADER_SIZE + ct1.length + ct2.length;
-        const out = Buffer.allocUnsafe(outLen);
-        let off = 0;
+        iv.writeBigUInt64BE(sum, 8);
 
-        iv.copy(out, off); off += 12;
-        tag.copy(out, off); off += 16;
-        ct1.copy(out, off); off += ct1.length;
-
-        if (ct2.length) {
-            ct2.copy(out, off);
-        }
-
-        return out;
+        return iv;
     }
 
-    private async decryptBlock(enc: Buffer): Promise<Buffer> {
-        if (enc.length < EncryptedFS.HEADER_SIZE) {
-            throw new Error('Data too short');
-        }
+    private decryptCTR(nonce: Buffer, blockCounter: bigint, ciphertext: Buffer): Buffer {
+        const iv = this.deriveCounterIV(nonce, blockCounter);
+        const decipher = crypto.createDecipheriv('aes-256-ctr', this.key, iv);
+        return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    }
 
-        const iv = enc.subarray(0, 12);
-        const tag = enc.subarray(12, 28);
-        const ciphertext = enc.subarray(28);
-        const decipher = crypto.createDecipheriv('aes-256-gcm', this.key, iv);
-
-        decipher.setAuthTag(tag);
-
-        const p1 = decipher.update(ciphertext);
-        const p2 = decipher.final();
-
-        if (p2.length) {
-            return Buffer.concat([p1, p2]);
-        }
-
-        return p1;
+    private encryptCTR(nonce: Buffer, blockCounter: bigint, plaintext: Buffer): Buffer {
+        const iv = this.deriveCounterIV(nonce, blockCounter);
+        const cipher = crypto.createCipheriv('aes-256-ctr', this.key, iv);
+        return Buffer.concat([cipher.update(plaintext), cipher.final()]);
     }
 
     private encodeName(name: string): string {
@@ -216,9 +194,15 @@ export class EncryptedFS {
                 }
 
                 try {
-                    const sizeBuf = Buffer.alloc(8);
-                    await fh.read(sizeBuf, 0, 8, 0);
-                    const fileSize = Number(sizeBuf.readBigInt64BE(0));
+                    const header = Buffer.alloc(EncryptedFS.META_SIZE);
+                    const { bytesRead: headRead } = await fh.read(header, 0, header.length, 0);
+
+                    if (headRead < EncryptedFS.META_SIZE) {
+                        cb(0);
+                        return;
+                    }
+                    const fileSize = Number(header.readBigInt64BE(0));
+                    const nonce = header.subarray(8, 8 + EncryptedFS.NONCE_SIZE);
 
                     if (pos >= fileSize) {
                         cb(0);
@@ -226,47 +210,42 @@ export class EncryptedFS {
                     }
 
                     const toReadTotal = Math.min(len, fileSize - pos);
+
                     let done = 0;
-
                     while (done < toReadTotal) {
-                        const blockIndex = Math.floor((pos + done) / EncryptedFS.BLOCK_SIZE);
-                        const blockOffset = (pos + done) % EncryptedFS.BLOCK_SIZE;
+                        const currentPos = pos + done;
+                        const blockIndex = Math.floor(currentPos / EncryptedFS.BLOCK_SIZE);
+                        const blockOffset = currentPos % EncryptedFS.BLOCK_SIZE;
+                        const toRead = Math.min(EncryptedFS.BLOCK_SIZE - blockOffset, toReadTotal - done);
+                        const absoluteDataStart = blockIndex * EncryptedFS.BLOCK_SIZE;
+                        const counterBlockStart = Math.floor(absoluteDataStart / EncryptedFS.AES_BLOCK) * EncryptedFS.AES_BLOCK;
+                        const offsetWithinCounterBlock = currentPos - counterBlockStart;
+                        const cipherFilePos = EncryptedFS.META_SIZE + counterBlockStart;
 
-                        let blockStart = EncryptedFS.META_SIZE;
-
-                        for (let i = 0; i < blockIndex; i++) {
-                            const hdr = Buffer.alloc(4);
-                            await fh.read(hdr, 0, 4, blockStart);
-                            const ctLen = hdr.readUInt32BE(0);
-                            blockStart += 4 + EncryptedFS.HEADER_SIZE + ctLen;
-                        }
-
-                        const hdr = Buffer.alloc(4);
-                        const { bytesRead: hbytes } = await fh.read(hdr, 0, 4, blockStart);
-                        if (hbytes !== 4) {
-                            break;
-                        }
-
-                        const ctLen = hdr.readUInt32BE(0);
-                        const enc = Buffer.alloc(ctLen + EncryptedFS.HEADER_SIZE);
-                        await fh.read(enc, 0, enc.length, blockStart + 4);
-
-                        const dec = await this.decryptBlock(enc);
-
-                        const toCopy = Math.min(
-                            dec.length - blockOffset,
-                            toReadTotal - done
+                        const cipherReadLen = Math.min(
+                            Math.ceil((offsetWithinCounterBlock + toRead) / EncryptedFS.AES_BLOCK) * EncryptedFS.AES_BLOCK,
+                            fileSize - counterBlockStart
                         );
 
-                        dec.subarray(blockOffset, blockOffset + toCopy)
-                        .copy(buf, done);
+                        const encBuf = Buffer.allocUnsafe(cipherReadLen);
+                        const { bytesRead: bRead } = await fh.read(encBuf, 0, cipherReadLen, cipherFilePos);
 
-                        done += toCopy;
+                        if (bRead === 0) {
+                            buf.fill(0, done, done + toRead);
+                        } else {
+                            const blockCounter = BigInt(counterBlockStart / EncryptedFS.AES_BLOCK);
+                            const plain = this.decryptCTR(nonce, blockCounter, encBuf.subarray(0, bRead));
+                            const srcStart = offsetWithinCounterBlock;
+                            const slice = plain.subarray(srcStart, srcStart + toRead);
+
+                            slice.copy(buf, done);
+                        }
+
+                        done += toRead;
                     }
 
                     cb(done);
-
-                } catch(e) {
+                } catch (e) {
                     console.error('READ ERROR', e);
                     cb(0);
                 }
@@ -274,77 +253,89 @@ export class EncryptedFS {
 
             write: async(_p, fd, buf, len, pos, cb): Promise<void> => {
                 const fh = this._handleCache.get(fd);
+
                 if (!fh) {
                     cb(0);
                     return;
                 }
 
                 try {
-                    // fileSize lesen
-                    const sizeBuf = Buffer.alloc(8);
-                    await fh.read(sizeBuf, 0, 8, 0);
-                    let fileSize = Number(sizeBuf.readBigInt64BE(0));
+                    const stat = await fh.stat();
+
+                    if (stat.size < EncryptedFS.META_SIZE) {
+                        const nb = Buffer.alloc(EncryptedFS.META_SIZE);
+                        nb.writeBigInt64BE(0n, 0);
+                        const nonce = crypto.randomBytes(EncryptedFS.NONCE_SIZE);
+                        nonce.copy(nb, 8);
+                        await fh.write(nb, 0, nb.length, 0);
+                    }
+
+                    const header = Buffer.alloc(EncryptedFS.META_SIZE);
+                    await fh.read(header, 0, header.length, 0);
+                    let fileSize = Number(header.readBigInt64BE(0));
+                    const nonce = header.subarray(8, 8 + EncryptedFS.NONCE_SIZE);
 
                     const endPos = pos + len;
-
                     if (endPos > fileSize) {
                         fileSize = endPos;
                     }
 
                     let bytesWritten = 0;
-
                     while (bytesWritten < len) {
-                        const blockIndex = Math.floor((pos + bytesWritten) / EncryptedFS.BLOCK_SIZE);
-                        const blockOffset = (pos + bytesWritten) % EncryptedFS.BLOCK_SIZE;
+                        const currentPos = pos + bytesWritten;
+                        const blockIndex = Math.floor(currentPos / EncryptedFS.BLOCK_SIZE);
+                        const blockOffset = currentPos % EncryptedFS.BLOCK_SIZE;
+                        const toWrite = Math.min(EncryptedFS.BLOCK_SIZE - blockOffset, len - bytesWritten);
 
-                        const toWrite = Math.min(
-                            EncryptedFS.BLOCK_SIZE - blockOffset,
-                            len - bytesWritten
+                        // determine counter-aligned region to read: start at counterBlockStart
+                        const absoluteBlockStart = blockIndex * EncryptedFS.BLOCK_SIZE;
+                        const counterBlockStart = Math.floor(absoluteBlockStart / EncryptedFS.AES_BLOCK) * EncryptedFS.AES_BLOCK;
+
+                        const cipherFilePos = EncryptedFS.META_SIZE + counterBlockStart;
+                        // read enough ciphertext to cover (blockOffset + toWrite), round up to AES_BLOCKs
+                        const needPlainBytes = blockOffset + toWrite;
+                        const cipherReadLen = Math.min(
+                            Math.ceil(needPlainBytes / EncryptedFS.AES_BLOCK) * EncryptedFS.AES_BLOCK,
+                            fileSize - counterBlockStart
                         );
 
-                        let blockStart = EncryptedFS.META_SIZE;
+                        const encBuf = Buffer.allocUnsafe(cipherReadLen);
+                        const { bytesRead: bRead } = await fh.read(encBuf, 0, cipherReadLen, cipherFilePos);
 
-                        for (let i = 0; i < blockIndex; i++) {
-                            const hdr = Buffer.alloc(4);
-                            await fh.read(hdr, 0, 4, blockStart);
-                            const ctLen = hdr.readUInt32BE(0);
-                            blockStart += 4 + EncryptedFS.HEADER_SIZE + ctLen;
+                        let plainBlock: Buffer;
+                        if (bRead > 0) {
+                            plainBlock = this.decryptCTR(nonce, BigInt(counterBlockStart / EncryptedFS.AES_BLOCK), encBuf.subarray(0, bRead));
+
+                            if (plainBlock.length < cipherReadLen) {
+                                const tmp = Buffer.alloc(cipherReadLen);
+                                plainBlock.copy(tmp, 0);
+                                plainBlock = tmp;
+                            }
+                        } else {
+                            plainBlock = Buffer.alloc(Math.max(needPlainBytes, 0));
                         }
 
-                        const hdr = Buffer.alloc(4);
-                        const { bytesRead: hbytes } = await fh.read(hdr, 0, 4, blockStart);
-
-                        const plain = Buffer.alloc(EncryptedFS.BLOCK_SIZE, 0);
-
-                        if (hbytes === 4) {
-                            const ctLen = hdr.readUInt32BE(0);
-                            const enc = Buffer.alloc(ctLen + EncryptedFS.HEADER_SIZE);
-                            await fh.read(enc, 0, enc.length, blockStart + 4);
-                            const dec = await this.decryptBlock(enc);
-                            dec.copy(plain, 0);
+                        if (plainBlock.length < blockOffset + toWrite) {
+                            const tmp = Buffer.alloc(blockOffset + toWrite);
+                            plainBlock.copy(tmp, 0);
+                            plainBlock = tmp;
                         }
 
-                        buf.subarray(bytesWritten, bytesWritten + toWrite).copy(plain, blockOffset);
+                        buf.copy(plainBlock, blockOffset, bytesWritten, bytesWritten + toWrite);
 
-                        const enc = await this.encryptBlock(
-                            plain.subarray(0, Math.max(blockOffset + toWrite))
-                        );
+                        const encNew = this.encryptCTR(nonce, BigInt(counterBlockStart / EncryptedFS.AES_BLOCK), plainBlock);
 
-                        const lenBuf = Buffer.alloc(4);
-                        lenBuf.writeUInt32BE(enc.length - EncryptedFS.HEADER_SIZE);
-
-                        await fh.write(lenBuf, 0, 4, blockStart);
-                        await fh.write(enc, 0, enc.length, blockStart + 4);
+                        await fh.write(encNew, 0, encNew.length, cipherFilePos);
 
                         bytesWritten += toWrite;
                     }
 
-                    sizeBuf.writeBigInt64BE(BigInt(fileSize));
+                    const sizeBuf = Buffer.alloc(8);
+                    sizeBuf.writeBigInt64BE(BigInt(fileSize), 0);
                     await fh.write(sizeBuf, 0, 8, 0);
 
                     cb(len);
-
-                } catch(e) {
+                } catch (e) {
                     console.error('WRITE ERROR', e);
                     cb(0);
                 }
@@ -354,16 +345,16 @@ export class EncryptedFS {
                 try {
                     const fullPath = this.mapPath(p);
                     const fh = await fs.open(fullPath, 'w+');
-
-                    const sizeBuf = Buffer.alloc(8);
-                    sizeBuf.writeBigInt64BE(0n);
-                    await fh.write(sizeBuf, 0, 8, 0);
+                    const buf = Buffer.alloc(EncryptedFS.META_SIZE);
+                    buf.writeBigInt64BE(0n, 0);
+                    const nonce = crypto.randomBytes(EncryptedFS.NONCE_SIZE);
+                    nonce.copy(buf, 8);
+                    await fh.write(buf, 0, buf.length, 0);
 
                     const handle = this._nextHandle++;
                     this._handleCache.set(handle, fh);
-
                     cb(0, handle);
-                } catch(e) {
+                } catch (e) {
                     console.error('CREATE ERROR', e);
                     cb(-1, 0);
                 }
