@@ -1,4 +1,5 @@
 import * as crypto from 'crypto';
+import {Stats} from 'fs';
 import * as fs from 'fs/promises';
 import Fuse from 'fuse-native';
 import * as path from 'path';
@@ -146,7 +147,16 @@ export class EncryptedFS {
      */
     public mount(): void {
         const fuse = new Fuse(this.mountPath, {
-            readdir: async(p, cb): Promise<void> => {
+
+            /**
+             * readdir
+             * @param {string} p
+             * @param {(err: number | null, names?: string[]) => void} cb
+             */
+            readdir: async(
+                p: string,
+                cb: (err: number | null, names?: string[]) => void
+            ): Promise<void> => {
                 const fullPath = p === '/' ? this.storagePath : this._mapPath(p);
 
                 try {
@@ -164,7 +174,15 @@ export class EncryptedFS {
                 }
             },
 
-            getattr: async(p, cb): Promise<void> => {
+            /**
+             * get attr
+             * @param {string} p
+             * @param {(err: number | null, stat?: Stats) => void} cb
+             */
+            getattr: async(
+                p: string,
+                cb: (err: number | null, stat?: Stats) => void
+            ): Promise<void> => {
                 const fullPath = p === '/' ? this.storagePath : this._mapPath(p);
 
                 try {
@@ -235,7 +253,23 @@ export class EncryptedFS {
                 }
             },
 
-            read: async(_p, fd, buf, len, pos, cb): Promise<void> => {
+            /**
+             * read
+             * @param {string} _p
+             * @param {number} fd
+             * @param {Buffer} buf
+             * @param {number} len
+             * @param {number} pos
+             * @param {(bytesRead: number) => void} cb
+             */
+            read: async(
+                _p: string,
+                fd: number,
+                buf: Buffer,
+                len: number,
+                pos: number,
+                cb: (bytesRead: number) => void
+            ): Promise<void> => {
                 const fh = this._handleCache.get(fd);
 
                 if (!fh) {
@@ -417,11 +451,15 @@ export class EncryptedFS {
 
             /**
              * Create
-             * @param p
-             * @param mode
-             * @param cb
+             * @param {string} p
+             * @param {number} mode
+             * @param {(err: number | null, fd?: number) => void} cb
              */
-            create: async(p, mode, cb): Promise<void> => {
+            create: async(
+                p: string,
+                mode: number,
+                cb: (err: number | null, fd?: number) => void
+            ): Promise<void> => {
                 try {
                     const fullPath = this._mapPath(p);
                     const fh = await fs.open(fullPath, 'w+');
@@ -446,11 +484,11 @@ export class EncryptedFS {
             /**
              * unlink
              * @param {string} p Path to file
-             * @param cb
+             * @param {(err: number | null) => void} cb
              */
             unlink: async(
                 p: string,
-                cb
+                cb: (err: number | null) => void
             ): Promise<void> => {
                 const fullPath = this._mapPath(p);
 
@@ -466,13 +504,13 @@ export class EncryptedFS {
             /**
              * mkdir
              * @param {string} p Path to directory
-             * @param mode
-             * @param cb
+             * @param {number} mode
+             * @param {(err: number | null) => void} cb
              */
             mkdir: async(
                 p: string,
-                mode,
-                cb
+                mode: number,
+                cb: (err: number | null) => void
             ): Promise<void> => {
                 const fullPath = this._mapPath(p);
 
@@ -488,11 +526,11 @@ export class EncryptedFS {
             /**
              * rmdir
              * @param {string} p Path to directory
-             * @param cb
+             * @param {(err: number | null) => void} cb
              */
             rmdir: async(
                 p: string,
-                cb
+                cb: (err: number | null) => void
             ): Promise<void> => {
                 const fullPath = this._mapPath(p);
 
@@ -509,12 +547,12 @@ export class EncryptedFS {
              * rename
              * @param {string} src
              * @param {string} dest
-             * @param cb
+             * @param {(err: number | null) => void} cb
              */
             rename: async(
                 src: string,
                 dest: string,
-                cb
+                cb: (err: number | null) => void
             ): Promise<void> => {
                 const fullSrc = this._mapPath(src);
                 const fullDest = this._mapPath(dest);
@@ -532,12 +570,12 @@ export class EncryptedFS {
              * release
              * @param {string} _path
              * @param {number} fd
-             * @param cb
+             * @param {(err: number | null) => void} cb
              */
             release: async(
                 _path: string,
                 fd: number,
-                cb
+                cb: (err: number | null) => void
             ): Promise<void> => {
                 const fh = this._handleCache.get(fd);
 
