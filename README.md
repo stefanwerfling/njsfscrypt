@@ -18,3 +18,25 @@ A tool for fuse file crypt
 sudo apt-get install libfuse-dev libck-dev
 ```
 
+# Use CLI
+```shell
+Usage:
+  njsfscrypt -keygen [length]
+  njsfscrypt -mount <storagePath> <mountPath> <hexKey>
+
+Commands:
+  -keygen               Generates a new encryption key.
+                        Optional: length (default 32)
+
+  -mount                Mounts an encrypted filesystem.
+                        Requires:
+                          1) storagePath  (folder containing encrypted files)
+                          2) mountPath    (FUSE mount folder)
+                          3) hexKey       (64 or 128 hex chars, depending on key size)
+
+Examples:
+  njsfscrypt -keygen
+  njsfscrypt -keygen 64
+  
+  njsfscrypt -mount ./storage ./mnt 012345abcdef...
+```

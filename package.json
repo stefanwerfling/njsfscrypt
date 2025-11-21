@@ -7,9 +7,18 @@
   "scripts": {
     "npm-check-updates": "npm-check-updates",
     "tsc": "tsc",
-    "build": "npm run tsc",
-    "update-figtree": "cd ./backend/ && npm run update-figtree"
+    "update-figtree": "cd ./backend/ && npm run update-figtree",
+    "prepare": "npm run build",
+    "clean": "rm -rf dist",
+    "build": "npm run clean && npm run compile && chmod +x ./dist/cli.js",
+    "compile": "tsc --project tsconfig.json"
   },
+  "bin": {
+    "njsfscrypt": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
   "keywords": [],
   "author": "Stefan Werfling",
   "license": "GPL-3.0-or-later",
