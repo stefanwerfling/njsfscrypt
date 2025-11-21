@@ -38,5 +38,22 @@ Examples:
   njsfscrypt -keygen
   njsfscrypt -keygen 64
   
-  njsfscrypt -mount ./storage ./mnt 012345abcdef...
+  njsfscrypt -mount ./storage/test ./mnt/test2 012345abcdef...
 ```
+
+### ✔️ Verify the Mount
+
+To confirm the filesystem is mounted correctly, run:
+
+```shell
+mount
+```
+
+
+You should see an entry similar to this:
+
+```shell
+/dev/fuse on /mnt/test2 type fuse (rw,nosuid,nodev,relatime,user_id=1000,group_id=1000)
+```
+
+This indicates that the FUSE filesystem is active and mounted at /mnt/test2.
