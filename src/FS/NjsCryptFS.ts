@@ -37,7 +37,18 @@ export class NjsCryptFS {
      * @protected
      */
     protected _handleCache = new Map<number, fs.FileHandle>();
+
+    /**
+     * next handle counter
+     * @private
+     */
     private _nextHandle = 100;
+
+    /**
+     * Fuse
+     * @protected
+     */
+    protected _fuse: Fuse|null = null;
 
     /**
      * constructor
@@ -146,7 +157,7 @@ export class NjsCryptFS {
      * Mount start
      */
     public mount(): void {
-        const fuse = new Fuse(this._mountPath, {
+        this._fuse = new Fuse(this._mountPath, {
 
             /**
              * readdir
@@ -312,6 +323,7 @@ export class NjsCryptFS {
                         );
 
                         const encBuf = Buffer.allocUnsafe(cipherReadLen);
+                        // eslint-disable-next-line no-await-in-loop
                         const { bytesRead: bRead } = await fh.read(encBuf, 0, cipherReadLen, cipherFilePos);
 
                         if (bRead === 0) {
@@ -402,6 +414,7 @@ export class NjsCryptFS {
                         );
 
                         const encBuf = Buffer.allocUnsafe(cipherReadLen);
+                        // eslint-disable-next-line no-await-in-loop
                         const { bytesRead: bRead } = await fh.read(encBuf, 0, cipherReadLen, cipherFilePos);
 
                         let plainBlock: Buffer;
@@ -433,6 +446,7 @@ export class NjsCryptFS {
                             plainBlock
                         );
 
+                        // eslint-disable-next-line no-await-in-loop
                         await fh.write(encNew, 0, encNew.length, cipherFilePos);
 
                         bytesWritten += toWrite;
@@ -588,7 +602,7 @@ export class NjsCryptFS {
             }
         }, { force: true, debug: false });
 
-        fuse.mount(err => {
+        this._fuse.mount(err => {
             if (err) {
                 console.error('Mount failed', err);
             } else {
@@ -596,15 +610,18 @@ export class NjsCryptFS {
             }
         });
 
-        process.on('SIGINT', () => this.unmount(fuse));
+        process.on('SIGINT', () => this.unmount());
     }
 
     /**
      * Unmount
-     * @param {Fuse} fuse
      */
-    public unmount(fuse?: Fuse): void {
-        fuse?.unmount(err => {
+    public unmount(): void {
+        if (this._fuse === null) {
+            return;
+        }
+
+        this._fuse.unmount(err => {
             if (err) {
                 console.error('Unmount failed', err);
             } else {
