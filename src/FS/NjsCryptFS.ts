@@ -5,6 +5,34 @@ import Fuse from 'fuse-native';
 import * as path from 'path';
 
 /**
+ * NjsCrypt FS Stats
+ */
+export type NjsCryptFSStats = {
+    readBytes: number;
+    writeBytes: number;
+    readBytesDuration: number;
+    writeBytesDuration: number;
+    readBytesTotal: number;
+    writeBytesTotal: number;
+    readTimeMs: number;
+    writeTimeMs: number;
+    readOps: number;
+    writeOps: number;
+};
+
+export enum NjsCryptFSLoggerLevel {
+    error,
+    info,
+    warn,
+    log
+}
+
+/**
+ * NjsCrypt FS Logger
+ */
+export type NjsCryptFSLogger = (level: NjsCryptFSLoggerLevel, str: string, e?: unknown) => void;
+
+/**
  * NjsCrypt File System
  */
 export class NjsCryptFS {
@@ -49,6 +77,18 @@ export class NjsCryptFS {
      * @protected
      */
     protected _fuse: Fuse|null = null;
+
+    /**
+     * stats
+     * @private
+     */
+    private _statsMap = new Map<number, NjsCryptFSStats>();
+
+    /**
+     * Logger
+     * @private
+     */
+    private _logger: NjsCryptFSLogger|null = null;
 
     /**
      * constructor
@@ -154,6 +194,35 @@ export class NjsCryptFS {
     }
 
     /**
+     * Return the stats map
+     * @return {Map<number, NjsCryptFSStats>}
+     */
+    public getStats(): Map<number, NjsCryptFSStats> {
+        return this._statsMap;
+    }
+
+    /**
+     * log methode
+     * @param {NjsCryptFSLoggerLevel} level
+     * @param {string} str
+     * @param {unknown} e
+     * @private
+     */
+    private _log(level: NjsCryptFSLoggerLevel, str: string, e?: unknown): void {
+        if (this._logger) {
+            this._logger(level, str, e);
+        }
+    }
+
+    /**
+     * Set logger
+     * @param {NjsCryptFSLogger|null} logger
+     */
+    public setLogger(logger: NjsCryptFSLogger|null): void {
+        this._logger = logger;
+    }
+
+    /**
      * Mount start
      */
     public mount(): void {
@@ -179,7 +248,7 @@ export class NjsCryptFS {
                         }
                     });
 
-                    cb(0, files);
+                    cb(null, files);
                 } catch {
                     cb(-2, []);
                 }
@@ -200,7 +269,7 @@ export class NjsCryptFS {
                     const stat = await fs.stat(fullPath);
 
                     if (stat.isDirectory()) {
-                        cb(0, {
+                        cb(null, {
                             mtime: stat.mtime,
                             atime: stat.atime,
                             ctime: stat.ctime,
@@ -224,7 +293,7 @@ export class NjsCryptFS {
                         fileSize = Number(b.readBigInt64BE(0));
                     }
 
-                    cb(0, {
+                    cb(null, {
                         mtime: stat.mtime,
                         atime: stat.atime,
                         ctime: stat.ctime,
@@ -234,8 +303,18 @@ export class NjsCryptFS {
                         gid: stat.gid
                     } as any);
 
-                } catch {
-                    cb(-2, undefined);
+                } catch(e: unknown) {
+                    if (typeof e === 'object' && e !== null && 'code' in e) {
+                        if (e.code === 'ENOENT') {
+                            this._log(NjsCryptFSLoggerLevel.info, 'GETATTR FILE NOT FOUND', e);
+                            cb(-2);
+                            return;
+                        }
+                    }
+
+                    this._log(NjsCryptFSLoggerLevel.error, 'GETATTR ERROR', e);
+
+                    cb(-1);
                 }
             },
 
@@ -256,10 +335,23 @@ export class NjsCryptFS {
                     const id = this._nextHandle++;
 
                     this._handleCache.set(id, fh);
+                    this._statsMap.set(id, {
+                        readBytes: 0,
+                        writeBytes: 0,
+                        readBytesDuration: 0,
+                        writeBytesDuration: 0,
+                        readBytesTotal: 0,
+                        writeBytesTotal: 0,
+                        readTimeMs: 0,
+                        writeTimeMs: 0,
+                        readOps: 0,
+                        writeOps: 0
+                    });
 
                     cb(0, id);
                 } catch (e) {
-                    console.error('OPEN ERROR', e);
+                    this._log(NjsCryptFSLoggerLevel.error, 'OPEN ERROR', e);
+
                     cb(-1, 0);
                 }
             },
@@ -288,6 +380,8 @@ export class NjsCryptFS {
                     return;
                 }
 
+                const start = performance.now();
+
                 try {
                     const header = Buffer.alloc(NjsCryptFS.META_SIZE);
                     const { bytesRead: headRead } = await fh.read(header, 0, header.length, 0);
@@ -307,6 +401,7 @@ export class NjsCryptFS {
                     const toReadTotal = Math.min(len, fileSize - pos);
 
                     let done = 0;
+
                     while (done < toReadTotal) {
                         const currentPos = pos + done;
                         const blockIndex = Math.floor(currentPos / NjsCryptFS.BLOCK_SIZE);
@@ -340,9 +435,23 @@ export class NjsCryptFS {
                         done += toRead;
                     }
 
+                    const duration = performance.now() - start;
+                    const stats = this._statsMap.get(fd);
+
+                    if (stats) {
+                        stats.readOps++;
+                        stats.readBytes = done;
+                        stats.readBytesDuration = duration;
+                        stats.readBytesTotal += done;
+                        stats.readTimeMs += duration;
+
+                        this._statsMap.set(fd, stats);
+                    }
+
                     cb(done);
                 } catch (e) {
-                    console.error('READ ERROR', e);
+                    this._log(NjsCryptFSLoggerLevel.error,'READ ERROR', e);
+
                     cb(0);
                 }
             },
@@ -368,6 +477,8 @@ export class NjsCryptFS {
                     cb(0);
                     return;
                 }
+
+                const start = performance.now();
 
                 try {
                     const stat = await fh.stat();
@@ -456,9 +567,25 @@ export class NjsCryptFS {
                     sizeBuf.writeBigInt64BE(BigInt(fileSize), 0);
                     await fh.write(sizeBuf, 0, 8, 0);
 
+                    // -------------------------------------------------------------------------------------------------
+
+                    const duration = performance.now() - start;
+                    const stats = this._statsMap.get(fd);
+
+                    if (stats) {
+                        stats.writeOps++;
+                        stats.writeBytes = len;
+                        stats.writeBytesTotal += len;
+                        stats.writeBytesDuration = duration;
+                        stats.writeTimeMs += duration;
+
+                        this._statsMap.set(fd, stats);
+                    }
+
                     cb(len);
                 } catch (e) {
-                    console.error('WRITE ERROR', e);
+                    this._log(NjsCryptFSLoggerLevel.error,'WRITE ERROR', e);
+
                     cb(0);
                 }
             },
@@ -488,10 +615,12 @@ export class NjsCryptFS {
 
                     const handle = this._nextHandle++;
                     this._handleCache.set(handle, fh);
-                    cb(0, handle);
+
+                    cb(null, handle);
                 } catch (e) {
-                    console.error('CREATE ERROR', e);
-                    cb(-1, 0);
+                    this._log(NjsCryptFSLoggerLevel.error,'CREATE ERROR', e);
+
+                    cb(-1);
                 }
             },
 
@@ -508,8 +637,8 @@ export class NjsCryptFS {
 
                 try {
                     await fs.unlink(fullPath);
-                } catch {
-                    console.log(`Error unlink ${fullPath}`);
+                } catch(e) {
+                    this._log(NjsCryptFSLoggerLevel.error, `Error unlink ${fullPath}`, e);
                 }
 
                 cb(0);
@@ -530,8 +659,8 @@ export class NjsCryptFS {
 
                 try {
                     await fs.mkdir(fullPath, {mode: mode});
-                } catch {
-                    console.log(`Error mkdir ${fullPath}`);
+                } catch(e) {
+                    this._log(NjsCryptFSLoggerLevel.error, `Error mkdir ${fullPath}`, e);
                 }
 
                 cb(0);
@@ -550,8 +679,8 @@ export class NjsCryptFS {
 
                 try {
                     await fs.rmdir(fullPath);
-                } catch {
-                    console.log(`Error rmdir ${fullPath}`);
+                } catch(e) {
+                    this._log(NjsCryptFSLoggerLevel.error, `Error rmdir ${fullPath}`, e);
                 }
 
                 cb(0);
@@ -573,8 +702,8 @@ export class NjsCryptFS {
 
                 try {
                     await fs.rename(fullSrc, fullDest);
-                } catch {
-                    console.log(`Error rename ${fullSrc} -> ${fullDest}`);
+                } catch(e) {
+                    this._log(NjsCryptFSLoggerLevel.error, `Error rename ${fullSrc} -> ${fullDest}`, e);
                 }
 
                 cb(0);
@@ -596,6 +725,7 @@ export class NjsCryptFS {
                 if (fh) {
                     await fh.close();
                     this._handleCache.delete(fd);
+                    this._statsMap.delete(fd);
                 }
 
                 cb(0);
@@ -604,9 +734,9 @@ export class NjsCryptFS {
 
         this._fuse.mount(err => {
             if (err) {
-                console.error('Mount failed', err);
+                this._log(NjsCryptFSLoggerLevel.error, 'Mount failed', err);
             } else {
-                console.log('Mounted', this._mountPath);
+                this._log(NjsCryptFSLoggerLevel.log,'Mounted', this._mountPath);
             }
         });
 
@@ -623,9 +753,9 @@ export class NjsCryptFS {
 
         this._fuse.unmount(err => {
             if (err) {
-                console.error('Unmount failed', err);
+                this._log(NjsCryptFSLoggerLevel.error, 'Unmount failed', err);
             } else {
-                console.log('Unmounted', this._mountPath);
+                this._log(NjsCryptFSLoggerLevel.log, 'Unmounted', this._mountPath);
             }
 
             process.exit(0);
