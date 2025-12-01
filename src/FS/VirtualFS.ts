@@ -15,6 +15,22 @@ export enum VirtualFSLoggerLevel {
 export type VirtualFSLogger = (level: VirtualFSLoggerLevel, str: string, e?: unknown) => void;
 
 /**
+ * Crypt FS Stats
+ */
+export type CryptFSStats = {
+    readBytes: number;
+    writeBytes: number;
+    readBytesDuration: number;
+    writeBytesDuration: number;
+    readBytesTotal: number;
+    writeBytesTotal: number;
+    readTimeMs: number;
+    writeTimeMs: number;
+    readOps: number;
+    writeOps: number;
+};
+
+/**
  * Virtual FileSystem
  */
 export class VirtualFS {
@@ -32,15 +48,25 @@ export class VirtualFS {
      * Fuse object
      * @private
      */
-    private _fuse: Fuse;
+    private readonly _fuse: Fuse;
 
-    private _mountPath: string;
+    /**
+     * Mount Path
+     * @private
+     */
+    private readonly _mountPath: string;
 
     /**
      * Logger
      * @private
      */
     private _logger: VirtualFSLogger|null = null;
+
+    /**
+     * stats
+     * @private
+     */
+    private _statsMap = new Map<string, CryptFSStats>();
 
     /**
      * constructor
@@ -103,6 +129,14 @@ export class VirtualFS {
      */
     public setLogger(logger: VirtualFSLogger|null): void {
         this._logger = logger;
+    }
+
+    /**
+     * Return the stats map
+     * @return {Map<number, CryptFSStats>}
+     */
+    public getStats(): Map<string, CryptFSStats> {
+        return this._statsMap;
     }
 
     /**
@@ -190,6 +224,19 @@ export class VirtualFS {
             const resolve = this._resolve(path);
             const fd = await resolve.fs.open(resolve.relPath, flags);
 
+            this._statsMap.set(`${path}:${fd}`, {
+                readBytes: 0,
+                writeBytes: 0,
+                readBytesDuration: 0,
+                writeBytesDuration: 0,
+                readBytesTotal: 0,
+                writeBytesTotal: 0,
+                readTimeMs: 0,
+                writeTimeMs: 0,
+                readOps: 0,
+                writeOps: 0
+            });
+
             cb(0, fd);
         } catch(err) {
             this._log(VirtualFSLoggerLevel.error, 'OPEN ERROR', err);
@@ -208,10 +255,30 @@ export class VirtualFS {
      */
     private async _read(path: string, fd: number, buf: Buffer, len: number, pos: number, cb: (bytesRead: number) => void): Promise<void> {
         try {
+            const start = performance.now();
+
             const resolve = this._resolve(path);
             const data = await resolve.fs.read(resolve.relPath, fd, len, pos);
 
             data.copy(buf, 0, 0, data.length);
+
+            // stats ---------------------------------------------------------------------------------------------------
+
+            const duration = performance.now() - start;
+            const statsKey = `${path}:${fd}`;
+            const stats = this._statsMap.get(statsKey);
+
+            if (stats) {
+                stats.readOps++;
+                stats.readBytes = data.length;
+                stats.readBytesDuration = duration;
+                stats.readBytesTotal += data.length;
+                stats.readTimeMs += duration;
+
+                this._statsMap.set(statsKey, stats);
+            }
+
+            // ---------------------------------------------------------------------------------------------------------
 
             cb(data.length);
         } catch(err) {
@@ -231,8 +298,28 @@ export class VirtualFS {
      */
     private async _write(path: string, fd: number, buf: Buffer, len: number, pos: number, cb: (written: number) => void): Promise<void> {
         try {
+            const start = performance.now();
+
             const resolve = this._resolve(path);
             const written = await resolve.fs.write(resolve.relPath, fd, buf.subarray(0, len), pos);
+
+            // stats ---------------------------------------------------------------------------------------------------
+
+            const duration = performance.now() - start;
+            const statsKey = `${path}:${fd}`;
+            const stats = this._statsMap.get(statsKey);
+
+            if (stats) {
+                stats.writeOps++;
+                stats.writeBytes = written;
+                stats.writeBytesTotal += written;
+                stats.writeBytesDuration = duration;
+                stats.writeTimeMs += duration;
+
+                this._statsMap.set(statsKey, stats);
+            }
+
+            // ---------------------------------------------------------------------------------------------------------
 
             cb(written);
         } catch(err) {
@@ -340,6 +427,12 @@ export class VirtualFS {
         }
     }
 
+    /**
+     * To fuse error
+     * @param {unknown} err
+     * @return {number}
+     * @protected
+     */
     protected _toFuseError(err: unknown): number {
         if (typeof err === 'object' && err !== null) {
             const e = err as { errno?: number; code?: number; };
@@ -366,12 +459,18 @@ export class VirtualFS {
             const resolve = this._resolve(path);
             await resolve.fs.release(resolve.relPath, fd);
 
+            this._statsMap.delete(`${path}:${fd}`);
+
             cb(0);
         } catch (err: unknown) {
             cb(this._toFuseError(err));
         }
     }
 
+    /**
+     * Mount
+     * @param {boolean} processSigInt
+     */
     public mount(processSigInt: boolean = true): void {
         this._fuse.mount(err => {
             if (err) {
@@ -388,6 +487,7 @@ export class VirtualFS {
 
     /**
      * Unmount
+     * @param {boolean} processExit
      */
     public unmount(processExit: boolean = false): void {
         if (this._fuse === null) {

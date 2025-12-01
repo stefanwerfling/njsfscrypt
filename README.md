@@ -57,3 +57,8 @@ You should see an entry similar to this:
 ```
 
 This indicates that the FUSE filesystem is active and mounted at /mnt/test2.
+
+### Screenshots
+![CLI Mount](doc/images/cli_mount.png)
+
+![CLI Mount directory](doc/images/cli_mount_dirs.png)

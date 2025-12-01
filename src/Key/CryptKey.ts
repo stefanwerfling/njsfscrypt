@@ -1,6 +1,6 @@
 import * as crypto from 'crypto';
 
-export class NjsCryptKey {
+export class CryptKey {
 
     public static generate(bytesLen: number = 32): string {
         const keybuffer = crypto.randomBytes(bytesLen);
