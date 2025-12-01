@@ -1,26 +1,44 @@
-import {NjsCryptFS, NjsCryptFSLoggerLevel} from './FS/NjsCryptFS.js';
+import {CryptFS} from './FS/CryptFS.js';
+import {VirtualFS, VirtualFSLoggerLevel} from './FS/VirtualFS.js';
 
 const pathStorage = '/home/swe/Desktop/Unbenannter Ordner/test';
+const pathStorage2 = '/home/swe/Desktop/Unbenannter Ordner/test3';
 const pathMount2 = '/home/swe/Desktop/Unbenannter Ordner/test2';
 
 // crypto.randomBytes(32)
 const key = Buffer.from('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'hex');
+const key2 = Buffer.from('0553456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'hex');
 
-const fsEncrypted = new NjsCryptFS(pathStorage, pathMount2, key);
-fsEncrypted.setLogger((level, str, e) => {
+//const fsEncrypted = new NjsCryptFS(pathStorage, pathMount2, key);
+
+const vfs = new VirtualFS(pathMount2);
+
+vfs.setLogger((level, str, e) => {
     switch (level) {
-        case NjsCryptFSLoggerLevel.error:
+        case VirtualFSLoggerLevel.error:
             console.error(str, e);
             break;
 
-        case NjsCryptFSLoggerLevel.log:
+        case VirtualFSLoggerLevel.log:
             console.log(str, e);
     }
 });
 
-fsEncrypted.mount();
+vfs.register('/', new CryptFS({
+    blockSize: 64 * 1024,
+    baseDir: pathStorage,
+    encryptionKey: key
+}));
 
-setInterval(() => {
+vfs.register('/crypt2', new CryptFS({
+    blockSize: 64 * 1024,
+    baseDir: pathStorage2,
+    encryptionKey: key2
+}));
+
+vfs.mount();
+
+/*setInterval(() => {
     const statsMap = fsEncrypted.getStats();
 
     statsMap.forEach((stats, fileHandler) => {
@@ -33,4 +51,4 @@ setInterval(() => {
         console.log(`[WRITE: ${fileHandler}] ${stats.writeBytes} bytes in ${(stats.writeBytesDuration/1000).toFixed(3)}s = ${((stats.writeBytes/1024/1024)/(stats.writeBytesDuration/1000)).toFixed(2)} MB/s`);
         console.log(`[STATS: ${fileHandler}] Read: ${rb} MB in ${rt}s, Write: ${wb} MB in ${wt}s`);
     });
-}, 1000);
+}, 1000);*/

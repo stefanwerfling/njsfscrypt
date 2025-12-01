@@ -4,7 +4,9 @@
     "njsfscrypt": "./dist/cli.js"
   },
   "dependencies": {
-    "fuse-native": "^2.2.6"
+    "fuse-native": "^2.2.6",
+    "selfsigned": "^4.0.0",
+    "vite": "^7.2.4"
   },
   "description": "A tool for fuse file crypt",
   "devDependencies": {

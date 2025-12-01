@@ -2,46 +2,6 @@ declare module 'fuse-native' {
     import { Stats } from 'fs';
     import { Buffer } from 'buffer';
 
-    /** Error codes exposed by fuse-native */
-    export const EPERM: number;
-    export const ENOENT: number;
-    export const ESRCH: number;
-    export const EINTR: number;
-    export const EIO: number;
-    export const ENXIO: number;
-    export const E2BIG: number;
-    export const ENOEXEC: number;
-    export const EBADF: number;
-    export const ECHILD: number;
-    export const EAGAIN: number;
-    export const ENOMEM: number;
-    export const EACCES: number;
-    export const EFAULT: number;
-    export const ENOTBLK: number;
-    export const EBUSY: number;
-    export const EEXIST: number;
-    export const EXDEV: number;
-    export const ENODEV: number;
-    export const ENOTDIR: number;
-    export const EISDIR: number;
-    export const EINVAL: number;
-    export const ENFILE: number;
-    export const EMFILE: number;
-    export const ENOTTY: number;
-    export const ETXTBSY: number;
-    export const EFBIG: number;
-    export const ENOSPC: number;
-    export const ESPIPE: number;
-    export const EROFS: number;
-    export const EMLINK: number;
-    export const EPIPE: number;
-    export const EDOM: number;
-    export const ERANGE: number;
-    export const EDEADLK: number;
-    export const ENAMETOOLONG: number;
-    export const ENOLCK: number;
-    export const ENOSYS: number;
-
     export interface FuseOps {
         getattr?: (
             path: string,
@@ -188,5 +148,43 @@ declare module 'fuse-native' {
 
         public static unmount(mountPath: string, cb: (err?: any) => void): void;
 
+        public static EPERM: number;
+        public static ENOENT: number;
+        public static ESRCH: number;
+        public static EINTR: number;
+        public static EIO: number;
+        public static ENXIO: number;
+        public static E2BIG: number;
+        public static ENOEXEC: number;
+        public static EBADF: number;
+        public static ECHILD: number;
+        public static EAGAIN: number;
+        public static ENOMEM: number;
+        public static EACCES: number;
+        public static EFAULT: number;
+        public static ENOTBLK: number;
+        public static EBUSY: number;
+        public static EEXIST: number;
+        public static EXDEV: number;
+        public static ENODEV: number;
+        public static ENOTDIR: number;
+        public static EISDIR: number;
+        public static EINVAL: number;
+        public static ENFILE: number;
+        public static EMFILE: number;
+        public static ENOTTY: number;
+        public static ETXTBSY: number;
+        public static EFBIG: number;
+        public static ENOSPC: number;
+        public static ESPIPE: number;
+        public static EROFS: number;
+        public static EMLINK: number;
+        public static EPIPE: number;
+        public static EDOM: number;
+        public static ERANGE: number;
+        public static EDEADLK: number;
+        public static ENAMETOOLONG: number;
+        public static ENOLCK: number;
+        public static ENOSYS: number;
     }
 }
