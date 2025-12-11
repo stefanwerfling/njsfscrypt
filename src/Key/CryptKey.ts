@@ -9,7 +9,8 @@ export class CryptKey {
     }
 
     public static hexStrToBuffer(hexStr: string): Buffer {
-        return Buffer.from(hexStr, 'hex');
+        const originalKey = Buffer.from(hexStr, 'hex');
+        return crypto.createHash('sha256').update(originalKey).digest();
     }
 
 }
