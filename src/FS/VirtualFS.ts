@@ -1,12 +1,15 @@
 import {Stats} from 'fs';
-import Fuse from 'fuse-native';
+import Fuse, {StatFs} from 'fuse-native';
+import {ErrnoFuseCb} from '../Error/ErrnoFuseCb.js';
+import {ErrorUtils} from '../Utils/ErrorUtils.js';
 import {VirtualFSEntry} from './VirtualFSEntry.js';
 
 export enum VirtualFSLoggerLevel {
     error,
     info,
     warn,
-    log
+    log,
+    debug
 }
 
 /**
@@ -15,9 +18,9 @@ export enum VirtualFSLoggerLevel {
 export type VirtualFSLogger = (level: VirtualFSLoggerLevel, str: string, e?: unknown) => void;
 
 /**
- * Crypt FS Stats
+ * Virtual FS Stats
  */
-export type CryptFSStats = {
+export type VirtualFSStats = {
     readBytes: number;
     writeBytes: number;
     readBytesDuration: number;
@@ -45,6 +48,12 @@ export class VirtualFS {
     }[] = [];
 
     /**
+     * Debuging
+     * @protected
+     */
+    protected _debug: boolean = false;
+
+    /**
      * Fuse object
      * @private
      */
@@ -66,14 +75,16 @@ export class VirtualFS {
      * stats
      * @private
      */
-    private _statsMap = new Map<string, CryptFSStats>();
+    private _statsMap = new Map<string, VirtualFSStats>();
 
     /**
      * constructor
      * @param {string} mountPath
+     * @param {boolean} debug
      */
-    public constructor(private mountPath: string) {
+    public constructor(private mountPath: string, debug: boolean = false) {
         this._mountPath = mountPath;
+        this._debug = debug;
 
         this._fuse = new Fuse(mountPath, {
             readdir: this._readdir.bind(this),
@@ -86,10 +97,15 @@ export class VirtualFS {
             rmdir: this._rmdir.bind(this),
             mkdir: this._mkdir.bind(this),
             rename: this._rename.bind(this),
-            release: this._release.bind(this)
+            release: this._release.bind(this),
+            truncate: this._truncate.bind(this),
+            ftruncate: this._ftruncate.bind(this),
+            access: this._access.bind(this),
+            statfs: this._statfs.bind(this)
         }, {
             force: true,
-            debug: false
+            debug: debug,
+            //allow_other: true,
         });
     }
 
@@ -98,7 +114,11 @@ export class VirtualFS {
      * @param {string|RegExp} pattern
      * @param {VirtualFSEntry} instance
      */
-    public register(pattern: string | RegExp, instance: VirtualFSEntry): void {
+    public async register(pattern: string | RegExp, instance: VirtualFSEntry): Promise<void> {
+        if (!instance.isInit()) {
+            await instance.init();
+        }
+
         const regex =
             typeof pattern === 'string'
                 ? new RegExp(`^${pattern.replace(/\//gu, '\\/')}`, 'u')
@@ -119,7 +139,13 @@ export class VirtualFS {
      */
     private _log(level: VirtualFSLoggerLevel, str: string, e?: unknown): void {
         if (this._logger) {
-            this._logger(level, str, e);
+            if (level === VirtualFSLoggerLevel.debug) {
+                if (this._debug) {
+                    this._logger(level, str, e);
+                }
+            } else {
+                this._logger(level, str, e);
+            }
         }
     }
 
@@ -133,9 +159,9 @@ export class VirtualFS {
 
     /**
      * Return the stats map
-     * @return {Map<number, CryptFSStats>}
+     * @return {Map<number, VirtualFSStats>}
      */
-    public getStats(): Map<string, CryptFSStats> {
+    public getStats(): Map<string, VirtualFSStats> {
         return this._statsMap;
     }
 
@@ -185,14 +211,20 @@ export class VirtualFS {
      * @param {(err: number | null, names?: string[]) => void} cb
      */
     private async _readdir(path: string, cb: (err: number | null, names?: string[]) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_readdir call: ${path}`);
+
         try {
             const resolve = this._resolve(path);
-            const names = await resolve.fs.readdir(resolve.relPath);
+            let names = await resolve.fs.readdir(resolve.relPath);
 
-            cb(0, names);
+            names = ['.', '..', ...names];
+
+            this._log(VirtualFSLoggerLevel.debug, `_readdir return: ${path}`, names);
+
+            process.nextTick(cb, 0, names);
         } catch (err) {
             this._log(VirtualFSLoggerLevel.error, `READDIR ERROR: ${path}`, err);
-            cb(Fuse.ENOENT);
+            process.nextTick(cb, Fuse.ENOENT);
         }
     }
 
@@ -200,16 +232,90 @@ export class VirtualFS {
      * get attr
      * @param {string} path
      * @param {(err: number | null, stat?: Stats) => void} cb
+     * @private
      */
     private async _getattr(path: string, cb: (err: number | null, stat?: Stats) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_getattr call: ${path}`);
+
         try {
             const resolve = this._resolve(path);
             const stat = await resolve.fs.getattr(resolve.relPath);
 
-            cb(0, stat);
+            this._log(VirtualFSLoggerLevel.debug, `_getattr return: ${path}`, stat);
+
+            process.nextTick(cb, 0, stat);
         } catch(err) {
-            this._log(VirtualFSLoggerLevel.error, `GETATTR ERROR: ${path}`, err);
-            cb(Fuse.ENOENT);
+            let code = Fuse.ENOENT;
+
+            if (err instanceof ErrnoFuseCb) {
+                code = err.getFuseError();
+            } else if (ErrorUtils.isFsError(err) && typeof err.errno === 'number') {
+                code = err.errno;
+
+                if (err.errno > 0) {
+                    code = -err.errno;
+                }
+            }
+
+            this._log(
+                VirtualFSLoggerLevel.debug,
+                `_getattr error: ${path} -> ${code}`
+            );
+
+            process.nextTick(cb, code);
+        }
+    }
+
+    private async _statfs(path: string, cb: (err: number | null, stat?: StatFs) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_statfs call: ${path}`);
+
+        try {
+            const resolve = this._resolve(path);
+            const statefs = await resolve.fs.statfs(path);
+
+            process.nextTick(cb, 0, statefs);
+        } catch(err) {
+            if (err instanceof ErrnoFuseCb) {
+                this._log(VirtualFSLoggerLevel.debug, `_statfs error: ${path} -> Fuse-Code: ${err.getFuseError()}`);
+                process.nextTick(cb, err.getFuseError());
+                return;
+            } else if (ErrorUtils.isFsError(err)) {
+                this._log(VirtualFSLoggerLevel.debug, `_statfs error: ${path} -> Code: ${err.code} Syscall: ${err.syscall}`);
+            } else {
+                this._log(VirtualFSLoggerLevel.error, `_statfs error: ${path}`, err);
+            }
+
+            process.nextTick(cb, Fuse.ENOENT);
+        }
+    }
+
+    /**
+     * Access
+     * @param {string} path
+     * @param {number} mode
+     * @param {(err: number | null) => void} cb
+     * @private
+     */
+    private async _access(path: string, mode: number, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_access call: ${path}`);
+
+        try {
+            const resolve = this._resolve(path);
+            await resolve.fs.access(path, mode);
+
+            process.nextTick(cb, 0);
+        } catch(err) {
+            if (err instanceof ErrnoFuseCb) {
+                this._log(VirtualFSLoggerLevel.debug, `_access error: ${path} -> Fuse-Code: ${err.getFuseError()}`);
+                process.nextTick(cb, err.getFuseError());
+                return;
+            } else if (ErrorUtils.isFsError(err)) {
+                this._log(VirtualFSLoggerLevel.debug, `_access error: ${path} -> Code: ${err.code} Syscall: ${err.syscall}`);
+            } else {
+                this._log(VirtualFSLoggerLevel.error, `_access error: ${path}`, err);
+            }
+
+            process.nextTick(cb, Fuse.EACCES);
         }
     }
 
@@ -220,6 +326,8 @@ export class VirtualFS {
      * @param {(code: number, fd: number) => void} cb
      */
     private async _open(path: string, flags: number, cb: (err: number | null, fd?: number) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_open call: ${path}`);
+
         try {
             const resolve = this._resolve(path);
             const fd = await resolve.fs.open(resolve.relPath, flags);
@@ -254,6 +362,8 @@ export class VirtualFS {
      * @param {(bytesRead: number) => void} cb
      */
     private async _read(path: string, fd: number, buf: Buffer, len: number, pos: number, cb: (bytesRead: number) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_read call: ${path}`);
+
         try {
             const start = performance.now();
 
@@ -297,6 +407,8 @@ export class VirtualFS {
      * @param {(written: number) => void} cb
      */
     private async _write(path: string, fd: number, buf: Buffer, len: number, pos: number, cb: (written: number) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_write call: ${path}`);
+
         try {
             const start = performance.now();
 
@@ -335,6 +447,8 @@ export class VirtualFS {
      * @param {(err: number | null, fd?: number) => void} cb
      */
     private async _create(path: string, mode: number, cb: (err: number | null, fd?: number) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_create call: ${path}`);
+
         try {
             const resolve = this._resolve(path);
             const fd = await resolve.fs.create(resolve.relPath, mode);
@@ -352,6 +466,8 @@ export class VirtualFS {
      * @param {(err: number | null) => void} cb
      */
     private async _unlink(path: string, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_unlink call: ${path}`);
+
         try {
             const resolve = this._resolve(path);
             await resolve.fs.unlink(resolve.relPath);
@@ -370,14 +486,40 @@ export class VirtualFS {
      * @param {(err: number | null) => void} cb
      */
     private async _mkdir(path: string, mode: number, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_mkdir call: ${path}`);
+
         try {
             const resolve = this._resolve(path);
             await resolve.fs.mkdir(resolve.relPath, mode);
 
-            cb(0);
+            process.nextTick(cb, 0);
         } catch (err) {
             this._log(VirtualFSLoggerLevel.error, 'MKDIR ERROR', err);
-            cb(Fuse.ENOENT);
+
+            if (ErrorUtils.isFsError(err)) {
+                switch (err.code) {
+                    case 'EEXIST':
+                        process.nextTick(cb, Fuse.EEXIST);
+                        break;
+
+                    case 'ENOTDIR':
+                        process.nextTick(cb, Fuse.ENOTDIR);
+                        break;
+
+                    case 'ENOENT':
+                        process.nextTick(cb, Fuse.ENOENT);
+                        break;
+
+                    case 'EPERM':
+                        process.nextTick(cb, Fuse.EPERM);
+                        break;
+
+                    default:
+                        process.nextTick(cb, Fuse.EIO);
+                }
+            } else {
+                process.nextTick(cb, Fuse.EIO);
+            }
         }
     }
 
@@ -387,6 +529,8 @@ export class VirtualFS {
      * @param {(err: number | null) => void} cb
      */
     private async _rmdir(path: string, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_rmdir call: ${path}`);
+
         try {
             const resolve = this._resolve(path);
             await resolve.fs.rmdir(resolve.relPath);
@@ -394,6 +538,12 @@ export class VirtualFS {
             cb(0);
         } catch (err) {
             this._log(VirtualFSLoggerLevel.error, 'RMDIR ERROR', err);
+
+            if (err instanceof ErrnoFuseCb) {
+                cb(err.getFuseError());
+                return;
+            }
+
             cb(Fuse.ENOENT);
         }
     }
@@ -405,6 +555,8 @@ export class VirtualFS {
      * @param {(err: number | null) => void} cb
      */
     private async _rename(src: string, dest: string, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_rename call: ${src} -> ${dest}`);
+
         try {
             let tDest = dest;
 
@@ -455,15 +607,43 @@ export class VirtualFS {
      * @param {(err: number | null) => void} cb
      */
     private async _release(path: string, fd: number, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_release call: ${path}`);
+
         try {
             const resolve = this._resolve(path);
             await resolve.fs.release(resolve.relPath, fd);
 
             this._statsMap.delete(`${path}:${fd}`);
 
-            cb(0);
+            process.nextTick(cb, 0);
         } catch (err: unknown) {
-            cb(this._toFuseError(err));
+            process.nextTick(cb, this._toFuseError(err));
+        }
+    }
+
+    private async _truncate(path: string, size: number, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_truncate call: ${path}`);
+
+        try {
+            const resolve = this._resolve(path);
+            await resolve.fs.truncate(path, size);
+
+            process.nextTick(cb, 0);
+        } catch (err: unknown) {
+            process.nextTick(cb, this._toFuseError(err));
+        }
+    }
+
+    private async _ftruncate(path: string, fd: number, size: number, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_ftruncate call: ${path}`);
+
+        try {
+            const resolve = this._resolve(path);
+            await resolve.fs.ftruncate(path, fd, size);
+
+            process.nextTick(cb, 0);
+        } catch (err: unknown) {
+            process.nextTick(cb, this._toFuseError(err));
         }
     }
 

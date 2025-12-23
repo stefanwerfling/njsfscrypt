@@ -2,7 +2,43 @@ declare module 'fuse-native' {
     import { Stats } from 'fs';
     import { Buffer } from 'buffer';
 
+    export interface StatFs {
+        // block size
+        bsize: number;
+        // fragment size
+        frsize: number;
+        // total data blocks
+        blocks: number;
+        // free blocks
+        bfree: number;
+        // free blocks for unprivileged users
+        bavail: number;
+        // total file nodes (inodes)
+        files: number;
+        // free file nodes
+        ffree: number;
+        // free nodes for unprivileged users
+        favail: number;
+        // filesystem id
+        fsid: number;
+        // mount flags
+        flag: number;
+        // maximum filename length
+        namemax: number;
+    }
+
     export interface FuseOps {
+        access?: (
+            path: string,
+            mode: number,
+            cb: (err: number | null) => void
+        ) => void;
+
+        statfs?: (
+            path: string,
+            cb: (err: number | null, stat?: StatFs) => void
+        ) => void;
+
         getattr?: (
             path: string,
             cb: (err: number | null, stat?: Stats) => void
@@ -78,6 +114,13 @@ declare module 'fuse-native' {
             cb: (err: number | null) => void
         ) => void;
 
+        ftruncate?: (
+            path: string,
+            fd: number,
+            size: number,
+            cb: (err: number | null) => void
+        ) => void;
+
         open?: (
             path: string,
             flags: number,
@@ -133,6 +176,7 @@ declare module 'fuse-native' {
         debug?: boolean;
         allowOther?: boolean;
         name?: string;
+        allow_other?: boolean;
     }
 
     export default class Fuse {
@@ -186,5 +230,17 @@ declare module 'fuse-native' {
         public static ENAMETOOLONG: number;
         public static ENOLCK: number;
         public static ENOSYS: number;
+        public static ENOTEMPTY: number;
+        public static ELOOP: number;
+        public static EWOULDBLOCK: number;
+        public static ENOMSG: number;
+        public static EIDRM: number;
+        public static ECHRNG: number;
+        public static EL2NSYNC: number;
+        public static EL3HLT: number;
+        public static EL3RST: number;
+        public static ELNRNG: number;
+        public static EUNATCH: number;
+
     }
 }
