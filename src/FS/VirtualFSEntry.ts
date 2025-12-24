@@ -1,11 +1,15 @@
 import {Stats} from 'fs';
 import {StatFs} from 'fuse-native';
 
+/**
+ * Virtual File System Entry
+ */
 export interface VirtualFSEntry {
     init(): Promise<void>;
     isInit(): boolean;
     readdir(path: string): Promise<string[]>;
     getattr(path: string): Promise<Stats>;
+    setattr(path: string, attr: Partial<Stats>): Promise<void>;
     open(path: string, flags: number): Promise<number>;
     read(path: string, fd: number, length: number, offset: number): Promise<Buffer>;
     write(path: string, fd: number, buffer: Buffer, offset: number): Promise<number>;

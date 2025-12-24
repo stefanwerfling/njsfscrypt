@@ -1,5 +1,5 @@
 import Fuse, {StatFs} from 'fuse-native';
-import {stat, mkdir, readdir, rename, rmdir, truncate, unlink} from 'node:fs/promises';
+import {stat, mkdir, readdir, rename, rmdir, chmod, truncate, utimes, unlink} from 'node:fs/promises';
 import tpath from 'path';
 import {ErrnoFuseCb} from '../Error/ErrnoFuseCb.js';
 import {VirtualFSEntry} from './VirtualFSEntry.js';
@@ -46,6 +46,9 @@ export class DirectFS implements VirtualFSEntry {
         this._options = options;
     }
 
+    /**
+     * Init
+     */
     public async init(): Promise<void> {
         const st = await stat(this._options.baseDir);
 
@@ -56,6 +59,10 @@ export class DirectFS implements VirtualFSEntry {
         this._isInit = true;
     }
 
+    /**
+     * is Init
+     * @return {boolean}
+     */
     public isInit(): boolean {
         return this._isInit;
     }
@@ -166,6 +173,43 @@ export class DirectFS implements VirtualFSEntry {
         }
 
         return st;
+    }
+
+    /**
+     * Set attr
+     * @param {string} path
+     * @param {Partial<Stats>} attr
+     */
+    public async setattr(path: string, attr: Partial<Stats>): Promise<void> {
+        const isRoot = path === '/';
+        const dpath = isRoot ? this._options.baseDir : this._mapPath(path);
+
+        let st: Stats;
+        try {
+            st = await stat(dpath);
+        } catch {
+            throw new ErrnoFuseCb(Fuse.ENOENT, 'File not found');
+        }
+
+        if (isRoot && attr.size !== undefined) {
+            return;
+        }
+
+        if (attr.mode !== undefined) {
+            await chmod(dpath, attr.mode);
+        }
+
+        if (attr.size !== undefined) {
+            await truncate(dpath, attr.size);
+        }
+
+        if (attr.atime !== undefined || attr.mtime !== undefined) {
+            await utimes(
+                dpath,
+                attr.atime ?? st.atime,
+                attr.mtime ?? st.mtime
+            );
+        }
     }
 
     public async statfs(_path: string): Promise<StatFs> {

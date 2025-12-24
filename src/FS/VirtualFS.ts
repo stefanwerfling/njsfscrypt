@@ -89,6 +89,7 @@ export class VirtualFS {
         this._fuse = new Fuse(mountPath, {
             readdir: this._readdir.bind(this),
             getattr: this._getattr.bind(this),
+            setattr: this._setattr.bind(this),
             open: this._open.bind(this),
             read: this._read.bind(this),
             write: this._write.bind(this),
@@ -260,6 +261,43 @@ export class VirtualFS {
             this._log(
                 VirtualFSLoggerLevel.debug,
                 `_getattr error: ${path} -> ${code}`
+            );
+
+            process.nextTick(cb, code);
+        }
+    }
+
+    /**
+     * Set attr bind
+     * @param {string} path
+     * @param {Partial<Stats>} attr
+     * @param {(err: number | null) => void): Promise<void>} cb
+     * @private
+     */
+    private async _setattr(path: string, attr: Partial<Stats>, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_setattr call: ${path}`, attr);
+
+        try {
+            const resolve = this._resolve(path);
+            await resolve.fs.setattr(path, attr);
+
+            process.nextTick(cb, 0);
+        } catch(err) {
+            let code = Fuse.ENOENT;
+
+            if (err instanceof ErrnoFuseCb) {
+                code = err.getFuseError();
+            } else if (ErrorUtils.isFsError(err) && typeof err.errno === 'number') {
+                code = err.errno;
+
+                if (err.errno > 0) {
+                    code = -err.errno;
+                }
+            }
+
+            this._log(
+                VirtualFSLoggerLevel.debug,
+                `_setattr error: ${path} -> ${code}`
             );
 
             process.nextTick(cb, code);

@@ -44,6 +44,12 @@ declare module 'fuse-native' {
             cb: (err: number | null, stat?: Stats) => void
         ) => void;
 
+        setattr?: (
+            path: string,
+            attr: Partial<Stats>,
+            cb: (err: number | null) => void
+        ) => void;
+
         readdir?: (
             path: string,
             cb: (err: number | null, names?: string[]) => void
