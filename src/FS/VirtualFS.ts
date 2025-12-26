@@ -383,10 +383,10 @@ export class VirtualFS {
                 writeOps: 0
             });
 
-            cb(0, fd);
+            process.nextTick(cb, 0, fd);
         } catch(err) {
             this._log(VirtualFSLoggerLevel.error, 'OPEN ERROR', err);
-            cb(Fuse.ENOENT);
+            process.nextTick(cb, Fuse.ENOENT);
         }
     }
 
@@ -428,10 +428,10 @@ export class VirtualFS {
 
             // ---------------------------------------------------------------------------------------------------------
 
-            cb(data.length);
+            process.nextTick(cb, data.length);
         } catch(err) {
             this._log(VirtualFSLoggerLevel.error, 'READ ERROR', err);
-            cb(-Fuse.ENOENT);
+            process.nextTick(cb, -Fuse.ENOENT);
         }
     }
 
@@ -471,10 +471,10 @@ export class VirtualFS {
 
             // ---------------------------------------------------------------------------------------------------------
 
-            cb(written);
+            process.nextTick(cb, written);
         } catch(err) {
             this._log(VirtualFSLoggerLevel.error, 'WRITE ERROR', err);
-            cb(-Fuse.ENOENT);
+            process.nextTick(cb, -Fuse.ENOENT);
         }
     }
 
@@ -491,10 +491,10 @@ export class VirtualFS {
             const resolve = this._resolve(path);
             const fd = await resolve.fs.create(resolve.relPath, mode);
 
-            cb(0, fd);
+            process.nextTick(cb, 0, fd);
         } catch(err) {
             this._log(VirtualFSLoggerLevel.error, 'CREATE ERROR', err);
-            cb(-Fuse.ENOENT);
+            process.nextTick(cb, -Fuse.ENOENT);
         }
     }
 
@@ -510,10 +510,10 @@ export class VirtualFS {
             const resolve = this._resolve(path);
             await resolve.fs.unlink(resolve.relPath);
 
-            cb(0);
+            process.nextTick(cb, 0);
         } catch (err) {
             this._log(VirtualFSLoggerLevel.error, 'UNLINK ERROR', err);
-            cb(Fuse.ENOENT);
+            process.nextTick(cb, Fuse.ENOENT);
         }
     }
 
@@ -573,16 +573,16 @@ export class VirtualFS {
             const resolve = this._resolve(path);
             await resolve.fs.rmdir(resolve.relPath);
 
-            cb(0);
+            process.nextTick(cb, 0);
         } catch (err) {
             this._log(VirtualFSLoggerLevel.error, 'RMDIR ERROR', err);
 
             if (err instanceof ErrnoFuseCb) {
-                cb(err.getFuseError());
+                process.nextTick(cb, err.getFuseError());
                 return;
             }
 
-            cb(Fuse.ENOENT);
+            process.nextTick(cb, Fuse.ENOENT);
         }
     }
 
@@ -610,10 +610,10 @@ export class VirtualFS {
 
             await resolve.fs.rename(resolve.relPath, tDest);
 
-            cb(0);
+            process.nextTick(cb, 0);
         } catch (err) {
             this._log(VirtualFSLoggerLevel.error, 'RENAME ERROR', err);
-            cb(Fuse.ENOENT);
+            process.nextTick(cb, Fuse.ENOENT);
         }
     }
 
