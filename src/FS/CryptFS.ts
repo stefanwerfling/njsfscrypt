@@ -1,8 +1,14 @@
+import Fuse, {StatFs} from 'fuse-native';
+import {constants} from 'node:fs';
+import {stat, chmod, truncate, utimes} from 'node:fs/promises';
+import {ErrnoFuseCb} from '../Error/ErrnoFuseCb.js';
+import {ErrorUtils} from '../Utils/ErrorUtils.js';
 import {VirtualFSEntry} from './VirtualFSEntry.js';
 import * as crypto from 'crypto';
-import {Stats} from 'fs';
 import * as fs from 'fs/promises';
+import {Stats} from 'fs';
 import * as tpath from 'path';
+import {VirtualFSHandler} from './VirtualFSHandler.js';
 
 interface CryptFSOptions {
     baseDir: string;
@@ -19,19 +25,50 @@ export class CryptFS implements VirtualFSEntry {
     private _options: CryptFSOptions;
 
     /**
-     * File handles
+     * Debuging
      * @protected
      */
-    protected _handleCache = new Map<number, fs.FileHandle>();
+    protected _debug: boolean = true;
 
     /**
-     * next handle counter
+     * Handler
      * @private
      */
-    private _nextHandle = 100;
+    private _handler: VirtualFSHandler = new VirtualFSHandler();
 
+    /**
+     * Is cfs init
+     * @private
+     */
+    private _isInit: boolean = false;
+
+    /**
+     * constructor
+     * @param {CryptFSOptions} options
+     */
     public constructor(options: CryptFSOptions) {
         this._options = options;
+    }
+
+    /**
+     * init
+     */
+    public async init(): Promise<void> {
+        const st = await stat(this._options.baseDir);
+
+        if (!st.isDirectory()) {
+            throw new Error(`baseDir is not a directory: ${this._options.baseDir}`);
+        }
+
+        this._isInit = true;
+    }
+
+    /**
+     * is init
+     * @return {boolean}
+     */
+    public isInit(): boolean {
+        return this._isInit;
     }
 
     /**
@@ -127,9 +164,31 @@ export class CryptFS implements VirtualFSEntry {
         return tpath.join(this._options.baseDir, ...encParts);
     }
 
+    /**
+     * Access file/directory
+     * @param {string} path
+     * @param {number} mode
+     */
+    public async access(path: string, mode: number): Promise<void> {
+        //const dpath = this._mapPath(path);
+        //await fs.access(dpath, mode);
+    }
+
+    /**
+     * Create file
+     * @param {string} path
+     * @param {number} mode
+     * @return {number}
+     */
     public async create(path: string, mode: number): Promise<number> {
-        const fullPath = this._mapPath(path);
-        const fh = await fs.open(fullPath, 'w+', mode);
+        const dpath = this._mapPath(path);
+        const flags =
+            // eslint-disable-next-line no-bitwise
+            constants.O_CREAT |
+            constants.O_TRUNC |
+            constants.O_RDWR;
+
+        const fh = await fs.open(dpath, flags, mode);
         const buf = Buffer.alloc(CryptFS.META_SIZE);
 
         buf.writeBigInt64BE(0n, 0);
@@ -139,71 +198,166 @@ export class CryptFS implements VirtualFSEntry {
 
         await fh.write(buf, 0, buf.length, 0);
 
-        const handle = this._nextHandle++;
-        this._handleCache.set(handle, fh);
-
-        return handle;
+        return this._handler.allocHandle({
+            fh: fh,
+            path: path,
+            realPath: dpath,
+            flags: flags
+        });
     }
 
+    /**
+     * statfs
+     * @param {string} _path
+     */
+    public async statfs(_path: string): Promise<StatFs> {
+        return {
+            bsize: 4096,
+            frsize: 4096,
+            blocks: 1000000,
+            bfree: 500000,
+            bavail: 500000,
+            files: 1000000,
+            ffree: 500000,
+            favail: 500000,
+            fsid: 1234,
+            flag: 0,
+            namemax: 255
+        };
+    }
+
+    /**
+     * Get attr
+     * @param {string} path
+     * @return {Stats}
+     */
     public async getattr(path: string): Promise<Stats> {
         const fullPath = path === '/' ? this._options.baseDir : this._mapPath(path);
 
-        const stat = await fs.stat(fullPath);
+        const tstat = await fs.stat(fullPath);
 
-        if (stat.isDirectory()) {
+        if (tstat.isDirectory()) {
             return {
-                mtime: stat.mtime,
-                atime: stat.atime,
-                ctime: stat.ctime,
-                size: stat.size,
-                mode: 0o040755,
-                uid: stat.uid,
-                gid: stat.gid
+                atime: tstat.atime,
+                mtime: tstat.mtime,
+                ctime: tstat.ctime,
+                size: tstat.size,
+                mode: tstat.mode,
+                uid: tstat.uid,
+                gid: tstat.gid
             } as any;
         }
 
+        // files -------------------------------------------------------------------------------------------------------
+
         let fileSize = 0;
 
-        if (stat.size >= CryptFS.META_SIZE) {
+        if (tstat.size >= CryptFS.META_SIZE) {
             const fh = await fs.open(fullPath, 'r');
-            const b = Buffer.alloc(8);
-            await fh.read(b, 0, 8, 0);
-            await fh.close();
 
-            fileSize = Number(b.readBigInt64BE(0));
+            try {
+                const buf = Buffer.alloc(8);
+                await fh.read(buf, 0, 8, 0);
+
+                fileSize = Number(buf.readBigInt64BE(0));
+            } finally {
+                await fh.close();
+            }
         }
 
         return {
-            mtime: stat.mtime,
-            atime: stat.atime,
-            ctime: stat.ctime,
+            atime: tstat.atime,
+            mtime: tstat.mtime,
+            ctime: tstat.ctime,
             size: fileSize,
-            mode: stat.mode,
-            uid: stat.uid,
-            gid: stat.gid
+            mode: tstat.mode,
+            uid: tstat.uid,
+            gid: tstat.gid
         } as any;
     }
 
+    /**
+     * Set attr
+     * @param {string} path
+     * @param {Partial<Stats>} attr
+     */
+    public async setattr(path: string, attr: Partial<Stats>): Promise<void> {
+        const isRoot = path === '/';
+        const dpath = isRoot ? this._options.baseDir : this._mapPath(path);
+
+        let st: Stats;
+        try {
+            st = await stat(dpath);
+        } catch {
+            throw new ErrnoFuseCb(Fuse.ENOENT, 'File not found');
+        }
+
+        if (isRoot && attr.size !== undefined) {
+            return;
+        }
+
+        if (attr.mode !== undefined) {
+            await chmod(dpath, attr.mode);
+        }
+
+        if (attr.size !== undefined) {
+            await truncate(dpath, attr.size);
+        }
+
+        if (attr.atime !== undefined || attr.mtime !== undefined) {
+            await utimes(
+                dpath,
+                attr.atime ?? st.atime,
+                attr.mtime ?? st.mtime
+            );
+        }
+    }
+
+    /**
+     * mkdir
+     * @param {string} path
+     * @param {number} mode
+     */
     public async mkdir(path: string, mode: number): Promise<void> {
         await fs.mkdir(this._mapPath(path), {mode: mode});
     }
 
+    /**
+     * open
+     * @param {string} path
+     * @param {number} flags
+     * @return {number}
+     */
     public async open(path: string, flags: number): Promise<number> {
-        const fullPath = this._mapPath(path);
-        const fh = await fs.open(fullPath, flags);
-        const id = this._nextHandle++;
+        const dpath = this._mapPath(path);
+        const fh = await fs.open(dpath, flags);
 
-        this._handleCache.set(id, fh);
-
-        return id;
+        return this._handler.allocHandle({
+            fh: fh,
+            path: path,
+            realPath: dpath,
+            flags: flags
+        });
     }
 
+    /**
+     * read
+     * @param {string} path
+     * @param {number} fd
+     * @param {number} length
+     * @param {number} offset
+     * @return {Buffer}
+     */
     public async read(path: string, fd: number, length: number, offset: number): Promise<Buffer> {
-        const fh = this._handleCache.get(fd);
+        const { fh } = this._handler.getHandle(fd);
 
         if (!fh) {
             throw new Error(`Filehandle not found: ${fd}`);
         }
+
+        /**
+         * Read header
+         */
 
         const header = Buffer.alloc(CryptFS.META_SIZE);
         const { bytesRead: headRead } = await fh.read(header, 0, header.length, 0);
@@ -222,55 +376,83 @@ export class CryptFS implements VirtualFSEntry {
         const toReadTotal = Math.min(length, fileSize - offset);
         const out = Buffer.alloc(toReadTotal);
 
+        /**
+         * calculate block range
+         */
+
+        const firstBlock = Math.floor(offset / this._options.blockSize);
+        const lastBlock  = Math.floor((offset + toReadTotal - 1) / this._options.blockSize);
+
         let done = 0;
 
-        while (done < toReadTotal) {
-            const currentPos = offset + done;
+        /**
+         * Read block
+         */
 
-            const blockIndex = Math.floor(currentPos / this._options.blockSize);
-            const blockOffset = currentPos % this._options.blockSize;
+        for (let block = firstBlock; block <= lastBlock; block++) {
+            const blockPlainStart = block * this._options.blockSize;
+            const blockPlainEnd   = blockPlainStart + this._options.blockSize;
 
-            const toRead = Math.min(
-                this._options.blockSize - blockOffset,
-                toReadTotal - done
-            );
+            const readStart = Math.max(offset, blockPlainStart);
+            const readEnd   = Math.min(offset + toReadTotal, blockPlainEnd);
 
-            const absoluteDataStart = blockIndex * this._options.blockSize;
+            const readLenInBlock = readEnd - readStart;
+            const readOffsetInBlock = readStart - blockPlainStart;
 
             const counterBlockStart =
-                Math.floor(absoluteDataStart / CryptFS.AES_BLOCK) * CryptFS.AES_BLOCK;
-
-            const offsetWithinCounterBlock = currentPos - counterBlockStart;
+                Math.floor(blockPlainStart / CryptFS.AES_BLOCK) * CryptFS.AES_BLOCK;
 
             const cipherFilePos = CryptFS.META_SIZE + counterBlockStart;
 
-            const cipherReadLen = Math.min(
-                Math.ceil((offsetWithinCounterBlock + toRead) / CryptFS.AES_BLOCK) * CryptFS.AES_BLOCK,
-                fileSize - counterBlockStart
+            const neededPlainBytes =
+                blockPlainEnd - counterBlockStart;
+
+            const cipherReadLen =
+                Math.ceil(neededPlainBytes / CryptFS.AES_BLOCK) * CryptFS.AES_BLOCK;
+
+            // read chipher --------------------------------------------------------------------------------------------
+
+            const encBuf = Buffer.alloc(cipherReadLen);
+            // eslint-disable-next-line no-await-in-loop
+            const { bytesRead } = await fh.read(
+                encBuf,
+                0,
+                cipherReadLen,
+                cipherFilePos
             );
 
-            const encBuf = Buffer.allocUnsafe(cipherReadLen);
-
-            // eslint-disable-next-line no-await-in-loop
-            const { bytesRead: bRead } = await fh.read(encBuf, 0, cipherReadLen, cipherFilePos);
-
-            if (bRead === 0) {
-                out.fill(0, done, done + toRead);
-            } else {
-                const blockCounter = BigInt(counterBlockStart / CryptFS.AES_BLOCK);
-                const plain = this._decryptCTR(nonce, blockCounter, encBuf.subarray(0, bRead));
-                const srcStart = offsetWithinCounterBlock;
-                const slice = plain.subarray(srcStart, srcStart + toRead);
-
-                slice.copy(out, done);
+            if (bytesRead < cipherReadLen) {
+                encBuf.fill(0, bytesRead);
             }
 
-            done += toRead;
+            // decrypt -------------------------------------------------------------------------------------------------
+
+            const plain = this._decryptCTR(
+                nonce,
+                BigInt(counterBlockStart / CryptFS.AES_BLOCK),
+                encBuf
+            );
+
+            // copy slice ----------------------------------------------------------------------------------------------
+
+            plain.copy(
+                out,
+                done,
+                readOffsetInBlock,
+                readOffsetInBlock + readLenInBlock
+            );
+
+            done += readLenInBlock;
         }
 
         return out;
     }
 
+    /**
+     * read dir
+     * @param {string} path
+     * @return {string[]}
+     */
     public async readdir(path: string): Promise<string[]> {
         const fullPath = path === '/' ? this._options.baseDir : this._mapPath(path);
 
@@ -283,15 +465,25 @@ export class CryptFS implements VirtualFSEntry {
         });
     }
 
+    /**
+     * release
+     * @param {string} path
+     * @param {number} fd
+     */
     public async release(path: string, fd: number): Promise<void> {
-        const fh = this._handleCache.get(fd);
+        const { fh } = this._handler.getHandle(fd);
 
         if (fh) {
             await fh.close();
-            this._handleCache.delete(fd);
+            this._handler.freeHandle(fd);
         }
     }
 
+    /**
+     * rename
+     * @param {string} src
+     * @param {string} dest
+     */
     public async rename(src: string, dest: string): Promise<void> {
         const fullSrc = this._mapPath(src);
         const fullDest = this._mapPath(dest);
@@ -299,106 +491,254 @@ export class CryptFS implements VirtualFSEntry {
         return fs.rename(fullSrc, fullDest);
     }
 
+    /**
+     * rmdir
+     * @param {string} path
+     */
     public async rmdir(path: string): Promise<void> {
-        return fs.rmdir(this._mapPath(path));
+        const fullPath = this._mapPath(path);
+
+        try {
+            const files = await fs.readdir(fullPath);
+
+            if (files.length > 0) {
+                throw new ErrnoFuseCb(Fuse.ENOTEMPTY, 'Directory not empty');
+            }
+
+            await fs.rmdir(this._mapPath(path));
+        } catch (e) {
+            if (e instanceof ErrnoFuseCb) {
+                throw e;
+            }
+
+            if (ErrorUtils.isFsError(e)) {
+                switch (e.code) {
+                    case 'ENOENT':
+                        throw new ErrnoFuseCb(Fuse.ENOENT);
+                }
+            }
+
+            throw new ErrnoFuseCb(Fuse.EIO, 'Failed to remove directory');
+        }
     }
 
+    /**
+     * unlink
+     * @param {string} path
+     */
     public async unlink(path: string): Promise<void> {
         return fs.unlink(this._mapPath(path));
     }
 
+    /**
+     * truncate
+     * @param {string} path
+     * @param {number} size
+     */
+    public async truncate(path: string, size: number): Promise<void> {
+        const fh = await fs.open(this._mapPath(path), 'r+');
+        try {
+            const header = Buffer.alloc(CryptFS.META_SIZE);
+            await fh.read(header, 0, header.length, 0);
+
+            const sizeBuf = Buffer.alloc(8);
+            sizeBuf.writeBigInt64BE(BigInt(size), 0);
+            await fh.write(sizeBuf, 0, 8, 0);
+
+            const blocks = Math.ceil(size / CryptFS.AES_BLOCK);
+            await fh.truncate(CryptFS.META_SIZE + (blocks * CryptFS.AES_BLOCK));
+        } finally {
+            await fh.close();
+        }
+    }
+
+    /**
+     * ftruncate
+     * @param {string} path
+     * @param {number} fd
+     * @param {number} size
+     */
+    public async ftruncate(path: string, fd: number, size: number): Promise<void> {
+        const { fh } = this._handler.getHandle(fd);
+
+        if (!fh) {
+            throw new ErrnoFuseCb(Fuse.EBADF);
+        }
+
+        if (size < 0) {
+            throw new ErrnoFuseCb(Fuse.EINVAL);
+        }
+
+        const header = Buffer.alloc(CryptFS.META_SIZE);
+        await fh.read(header, 0, header.length, 0);
+
+        // create new header -------------------------------------------------------------------------------------------
+
+        const sizeBuf = Buffer.alloc(8);
+        sizeBuf.writeBigInt64BE(BigInt(size), 0);
+        await fh.write(sizeBuf, 0, 8, 0);
+
+        // -------------------------------------------------------------------------------------------------------------
+
+        const blocks = Math.ceil(size / CryptFS.AES_BLOCK);
+        const newPhysicalSize =
+            CryptFS.META_SIZE + (blocks * CryptFS.AES_BLOCK);
+
+        const st = await fh.stat();
+
+        if (newPhysicalSize < st.size) {
+            await fh.truncate(newPhysicalSize);
+        }
+    }
+
+    /**
+     * write
+     * @param {string} path
+     * @param {number} fd
+     * @param {Buffer} buffer
+     * @param {number} offset
+     * @return {number}
+     */
     public async write(path: string, fd: number, buffer: Buffer, offset: number): Promise<number> {
-        const fh = this._handleCache.get(fd);
+        const { fh } = this._handler.getHandle(fd);
 
         if (!fh) {
             throw new Error(`Filehandle not found ${fd}`);
         }
 
-        const len = buffer.length;
-        const stat = await fh.stat();
+        const writeLen = buffer.length;
+        const writeEnd = offset + writeLen;
 
-        if (stat.size < CryptFS.META_SIZE) {
-            const nb = Buffer.alloc(CryptFS.META_SIZE);
-            nb.writeBigInt64BE(0n, 0);
-
-            const nonce = crypto.randomBytes(CryptFS.NONCE_SIZE);
-            nonce.copy(nb, 8);
-
-            await fh.write(nb, 0, nb.length, 0);
-        }
+        /**
+         * Header read or init
+         */
 
         const header = Buffer.alloc(CryptFS.META_SIZE);
+        let fileSize = 0;
+        let nonce: Buffer;
 
-        await fh.read(header, 0, header.length, 0);
+        const st = await fh.stat();
 
-        let fileSize = Number(header.readBigInt64BE(0));
-        const nonce = header.subarray(8, 8 + CryptFS.NONCE_SIZE);
+        if (st.size < CryptFS.META_SIZE) {
+            nonce = crypto.randomBytes(CryptFS.NONCE_SIZE);
+            header.writeBigInt64BE(0n, 0);
+            nonce.copy(header, 8);
 
-        const endPos = offset + len;
+            await fh.write(header, 0, header.length, 0);
+        } else {
+            await fh.read(header, 0, header.length, 0);
 
-        if (endPos > fileSize) {
-            fileSize = endPos;
+            fileSize = Number(header.readBigInt64BE(0));
+            nonce = header.subarray(8, 8 + CryptFS.NONCE_SIZE);
         }
+
+        /**
+         * New filesize
+         */
+
+        const newFileSize = Math.max(fileSize, writeEnd);
+
+        /**
+         * get plain block
+         */
+
+        const firstBlock = Math.floor(offset / this._options.blockSize);
+        const lastBlock  = Math.floor((writeEnd - 1) / this._options.blockSize);
 
         let bytesWritten = 0;
 
-        while (bytesWritten < len) {
-            const currentPos = offset + bytesWritten;
-            const blockIndex = Math.floor(currentPos / this._options.blockSize);
-            const blockOffset = currentPos % this._options.blockSize;
-            const toWrite = Math.min(this._options.blockSize - blockOffset, len - bytesWritten);
+        /**
+         * block read
+         */
 
-            const absoluteBlockStart = blockIndex * this._options.blockSize;
-            const counterBlockStart = Math.floor(absoluteBlockStart / CryptFS.AES_BLOCK) * CryptFS.AES_BLOCK;
+        for (let block = firstBlock; block <= lastBlock; block++) {
+            const blockPlainStart = block * this._options.blockSize;
+            const blockPlainEnd   = blockPlainStart + this._options.blockSize;
+
+            const writeStart = Math.max(offset, blockPlainStart);
+            const writeEndInBlock = Math.min(writeEnd, blockPlainEnd);
+
+            const writeLenInBlock = writeEndInBlock - writeStart;
+            const writeOffsetInBlock = writeStart - blockPlainStart;
+
+            // cipher offset (CTR Counter) -----------------------------------------------------------------------------
+
+            const counterBlockStart =
+                Math.floor(blockPlainStart / CryptFS.AES_BLOCK) * CryptFS.AES_BLOCK;
 
             const cipherFilePos = CryptFS.META_SIZE + counterBlockStart;
-            const needPlainBytes = blockOffset + toWrite;
-            const cipherReadLen = Math.min(
-                Math.ceil(needPlainBytes / CryptFS.AES_BLOCK) * CryptFS.AES_BLOCK,
-                fileSize - counterBlockStart
+
+            // how much? -----------------------------------------------------------------------------------------------
+
+            const neededPlainBytes =
+                Math.max(blockPlainEnd, writeEnd) - counterBlockStart;
+
+            const cipherReadLen =
+                Math.ceil(neededPlainBytes / CryptFS.AES_BLOCK) * CryptFS.AES_BLOCK;
+
+            // chipher read --------------------------------------------------------------------------------------------
+
+            const encBuf = Buffer.alloc(cipherReadLen);
+
+            // eslint-disable-next-line no-await-in-loop
+            const { bytesRead } = await fh.read(
+                encBuf,
+                0,
+                cipherReadLen,
+                cipherFilePos
             );
 
-            const encBuf = Buffer.allocUnsafe(cipherReadLen);
-            // eslint-disable-next-line no-await-in-loop
-            const { bytesRead: bRead } = await fh.read(encBuf, 0, cipherReadLen, cipherFilePos);
-
-            let plainBlock: Buffer;
-            if (bRead > 0) {
-                plainBlock = this._decryptCTR(nonce, BigInt(counterBlockStart / CryptFS.AES_BLOCK), encBuf.subarray(0, bRead));
-
-                if (plainBlock.length < cipherReadLen) {
-                    const tmp = Buffer.alloc(cipherReadLen);
-
-                    plainBlock.copy(tmp, 0);
-                    plainBlock = tmp;
-                }
-            } else {
-                plainBlock = Buffer.alloc(Math.max(needPlainBytes, 0));
+            if (bytesRead < cipherReadLen) {
+                encBuf.fill(0, bytesRead);
             }
 
-            if (plainBlock.length < blockOffset + toWrite) {
-                const tmp = Buffer.alloc(blockOffset + toWrite);
+            // decrypt -------------------------------------------------------------------------------------------------
 
-                plainBlock.copy(tmp, 0);
-                plainBlock = tmp;
+            let plain = this._decryptCTR(
+                nonce,
+                BigInt(counterBlockStart / CryptFS.AES_BLOCK),
+                encBuf
+            );
+
+            // new block add -------------------------------------------------------------------------------------------
+
+            if (plain.length < cipherReadLen) {
+                const tmp = Buffer.alloc(cipherReadLen);
+                plain.copy(tmp);
+                plain = tmp;
             }
 
-            buffer.copy(plainBlock, blockOffset, bytesWritten, bytesWritten + toWrite);
+            // new data write ------------------------------------------------------------------------------------------
+
+            buffer.copy(
+                plain,
+                writeOffsetInBlock,
+                bytesWritten,
+                bytesWritten + writeLenInBlock
+            );
+
+            bytesWritten += writeLenInBlock;
+
+            // encrypt -------------------------------------------------------------------------------------------------
 
             const encNew = this._encryptCTR(
                 nonce,
                 BigInt(counterBlockStart / CryptFS.AES_BLOCK),
-                plainBlock
+                plain
             );
+
+            // write to file -------------------------------------------------------------------------------------------
 
             // eslint-disable-next-line no-await-in-loop
             await fh.write(encNew, 0, encNew.length, cipherFilePos);
-
-            bytesWritten += toWrite;
         }
 
+        /**
+         * add new filesize to header and write
+         */
+
         const sizeBuf = Buffer.alloc(8);
-        sizeBuf.writeBigInt64BE(BigInt(fileSize), 0);
+        sizeBuf.writeBigInt64BE(BigInt(newFileSize), 0);
         await fh.write(sizeBuf, 0, 8, 0);
 
         return bytesWritten;
