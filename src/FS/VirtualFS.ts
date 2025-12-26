@@ -304,6 +304,12 @@ export class VirtualFS {
         }
     }
 
+    /**
+     * statfs
+     * @param {string} path
+     * @param {(err: number | null, stat?: StatFs) => void} cb
+     * @private
+     */
     private async _statfs(path: string, cb: (err: number | null, stat?: StatFs) => void): Promise<void> {
         this._log(VirtualFSLoggerLevel.debug, `_statfs call: ${path}`);
 
