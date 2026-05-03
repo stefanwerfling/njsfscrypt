@@ -4,7 +4,7 @@ export {VirtualFSHandler} from './FS/VirtualFSHandler.js';
 export {ErrnoException} from './Error/ErrnoException.js';
 export {ErrnoFuseCb} from './Error/ErrnoFuseCb.js';
 export {ErrorUtils} from './Utils/ErrorUtils.js';
-export {VirtualFS, VirtualFSLogger, VirtualFSLoggerLevel, VirtualFSStats} from './FS/VirtualFS.js';
+export {VirtualFS, VirtualFSLogger, VirtualFSLoggerLevel, VirtualFSStats, VirtualFSMountOptions} from './FS/VirtualFS.js';
 export {DirectFS} from './FS/DirectFS.js';
 export {CryptFS} from './FS/CryptFS.js';
 export {CryptKey} from './Key/CryptKey.js';

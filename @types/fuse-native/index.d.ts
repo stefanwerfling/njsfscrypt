@@ -28,6 +28,9 @@ declare module 'fuse-native' {
     }
 
     export interface FuseOps {
+        init?: (cb: (err: number | null) => void) => void;
+        error?: (cb: (err: number | null) => void) => void;
+
         access?: (
             path: string,
             mode: number,
@@ -111,6 +114,53 @@ declare module 'fuse-native' {
             path: string,
             uid: number,
             gid: number,
+            cb: (err: number | null) => void
+        ) => void;
+
+        utimens?: (
+            path: string,
+            atime: number,
+            mtime: number,
+            cb: (err: number | null) => void
+        ) => void;
+
+        flush?: (
+            path: string,
+            fd: number,
+            cb: (err: number | null) => void
+        ) => void;
+
+        fsync?: (
+            path: string,
+            datasync: boolean,
+            fd: number,
+            cb: (err: number | null) => void
+        ) => void;
+
+        getxattr?: (
+            path: string,
+            name: string,
+            position: number,
+            cb: (err: number | null, value?: Buffer) => void
+        ) => void;
+
+        setxattr?: (
+            path: string,
+            name: string,
+            value: Buffer,
+            position: number,
+            flags: number,
+            cb: (err: number | null) => void
+        ) => void;
+
+        listxattr?: (
+            path: string,
+            cb: (err: number | null, list?: string[]) => void
+        ) => void;
+
+        removexattr?: (
+            path: string,
+            name: string,
             cb: (err: number | null) => void
         ) => void;
 

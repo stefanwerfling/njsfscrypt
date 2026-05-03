@@ -1,6 +1,6 @@
 import Fuse, {StatFs} from 'fuse-native';
 import {constants} from 'node:fs';
-import {stat, chmod, truncate, utimes} from 'node:fs/promises';
+import {stat, chmod, chown, truncate, utimes} from 'node:fs/promises';
 import {ErrnoFuseCb} from '../Error/ErrnoFuseCb.js';
 import {ErrorUtils} from '../Utils/ErrorUtils.js';
 import {VirtualFSEntry} from './VirtualFSEntry.js';
@@ -234,7 +234,7 @@ export class CryptFS implements VirtualFSEntry {
     public async getattr(path: string): Promise<Stats> {
         const fullPath = path === '/' ? this._options.baseDir : this._mapPath(path);
 
-        const tstat = await fs.stat(fullPath);
+        const tstat = await fs.lstat(fullPath);
 
         if (tstat.isDirectory()) {
             return {
@@ -246,6 +246,25 @@ export class CryptFS implements VirtualFSEntry {
                 uid: tstat.uid,
                 gid: tstat.gid
             } as any;
+        }
+
+        // symlinks ----------------------------------------------------------------------------------------------------
+
+        if (tstat.isSymbolicLink()) {
+            let targetLen = 0;
+            try {
+                const onDisk = await fs.readlink(fullPath);
+                targetLen = this._decodeName(onDisk.toString()).length;
+            } catch {
+                // unreadable target — keep size 0 so ls shows something sane
+            }
+
+            // Return the live lstat Stats with the size patched to the
+            // decoded target length. Returning a plain object would lose
+            // the helper methods (isSymbolicLink etc.) consumers rely on.
+            (tstat as Stats & {size: number;}).size = targetLen;
+
+            return tstat;
         }
 
         // files -------------------------------------------------------------------------------------------------------
@@ -302,6 +321,14 @@ export class CryptFS implements VirtualFSEntry {
 
         if (attr.size !== undefined) {
             await truncate(dpath, attr.size);
+        }
+
+        if (attr.uid !== undefined || attr.gid !== undefined) {
+            await chown(
+                dpath,
+                attr.uid ?? st.uid,
+                attr.gid ?? st.gid
+            );
         }
 
         if (attr.atime !== undefined || attr.mtime !== undefined) {
@@ -528,6 +555,107 @@ export class CryptFS implements VirtualFSEntry {
      */
     public async unlink(path: string): Promise<void> {
         return fs.unlink(this._mapPath(path));
+    }
+
+    /**
+     * flush — no-op; encryption + write are synchronous from the caller's view
+     * and the actual handle close happens in release().
+     * @param {string} _path
+     * @param {number} _fd
+     */
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    public async flush(_path: string, _fd: number): Promise<void> {
+        // no-op
+    }
+
+    /**
+     * fsync / fdatasync — flush the encrypted file's kernel buffers to disk.
+     * @param {string} _path
+     * @param {number} fd
+     * @param {boolean} datasync true = fdatasync, false = full fsync
+     */
+    public async fsync(_path: string, fd: number, datasync: boolean): Promise<void> {
+        const {fh} = this._handler.getHandle(fd);
+
+        if (!fh) {
+            throw new Error(`Filehandle not found: ${fd}`);
+        }
+
+        if (datasync) {
+            await fh.datasync();
+        } else {
+            await fh.sync();
+        }
+    }
+
+    /**
+     * symlink — the on-disk symlink stores the target string encrypted with
+     * the same name-encoding as filenames. The kernel never resolves the
+     * on-disk target directly; readlink() decrypts it before returning.
+     * @param {string} target
+     * @param {string} linkPath
+     */
+    public async symlink(target: string, linkPath: string): Promise<void> {
+        const encodedTarget = this._encodeName(target);
+        await fs.symlink(encodedTarget, this._mapPath(linkPath));
+    }
+
+    /**
+     * readlink — read and decrypt the symlink target.
+     * @param {string} path
+     * @return {string}
+     */
+    public async readlink(path: string): Promise<string> {
+        const onDisk = await fs.readlink(this._mapPath(path));
+        return this._decodeName(onDisk.toString());
+    }
+
+    /**
+     * link — hard link two encoded names onto the same encrypted inode. The
+     * ciphertext (incl. header/nonce) is identical for both paths; the
+     * filenames differ only in their on-disk encoded form.
+     * @param {string} src
+     * @param {string} dest
+     */
+    public async link(src: string, dest: string): Promise<void> {
+        await fs.link(this._mapPath(src), this._mapPath(dest));
+    }
+
+    /**
+     * mknod — only regular files (S_IFREG) are accepted. The on-disk file is
+     * created with the standard CryptFS header (filesize=0 + fresh nonce) so
+     * subsequent reads return zero bytes.
+     * @param {string} path
+     * @param {number} mode
+     * @param {number} _dev
+     */
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    public async mknod(path: string, mode: number, _dev: number): Promise<void> {
+        // eslint-disable-next-line no-bitwise
+        const isRegular = (constants.S_IFMT & mode) === constants.S_IFREG;
+
+        if (!isRegular) {
+            throw new ErrnoFuseCb(Fuse.ENOSYS, 'CryptFS only supports regular files via mknod');
+        }
+
+        const dpath = this._mapPath(path);
+        const flags =
+            // eslint-disable-next-line no-bitwise
+            constants.O_CREAT |
+            constants.O_EXCL |
+            constants.O_WRONLY;
+
+        const fh = await fs.open(dpath, flags, mode);
+
+        try {
+            const buf = Buffer.alloc(CryptFS.META_SIZE);
+            buf.writeBigInt64BE(0n, 0);
+            const nonce = crypto.randomBytes(CryptFS.NONCE_SIZE);
+            nonce.copy(buf, 8);
+            await fh.write(buf, 0, buf.length, 0);
+        } finally {
+            await fh.close();
+        }
     }
 
     /**

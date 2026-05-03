@@ -23,4 +23,10 @@ export interface VirtualFSEntry {
     ftruncate(path: string, fd: number, size: number): Promise<void>;
     access(path: string, mode: number): Promise<void>;
     statfs(path: string): Promise<StatFs>;
+    flush(path: string, fd: number): Promise<void>;
+    fsync(path: string, fd: number, datasync: boolean): Promise<void>;
+    symlink(target: string, linkPath: string): Promise<void>;
+    readlink(path: string): Promise<string>;
+    link(src: string, dest: string): Promise<void>;
+    mknod(path: string, mode: number, dev: number): Promise<void>;
 }

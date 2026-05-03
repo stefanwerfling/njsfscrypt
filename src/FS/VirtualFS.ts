@@ -1,6 +1,5 @@
 import {Stats} from 'fs';
 import Fuse, {StatFs} from 'fuse-native';
-import {ErrnoFuseCb} from '../Error/ErrnoFuseCb.js';
 import {ErrorUtils} from '../Utils/ErrorUtils.js';
 import {VirtualFSEntry} from './VirtualFSEntry.js';
 
@@ -16,6 +15,31 @@ export enum VirtualFSLoggerLevel {
  * VirtualFS Logger
  */
 export type VirtualFSLogger = (level: VirtualFSLoggerLevel, str: string, e?: unknown) => void;
+
+/**
+ * Mount-time options surfaced from the underlying fuse-native FuseOptions.
+ * Only fields with safe defaults are exposed; everything else stays internal.
+ */
+export interface VirtualFSMountOptions {
+    /**
+     * If true, an existing FUSE mount at the same mountpoint is forcibly
+     * unmounted before this one is established. Convenient for development,
+     * dangerous on shared paths — defaults to true to preserve previous
+     * behaviour but can be turned off explicitly.
+     */
+    force?: boolean;
+
+    /**
+     * Allow access by users other than the mounter. Required for daemons that
+     * serve multiple local accounts.
+     */
+    allowOther?: boolean;
+
+    /**
+     * Display name for the mount (shown by `mount` / Finder etc.).
+     */
+    name?: string;
+}
 
 /**
  * Virtual FS Stats
@@ -81,15 +105,25 @@ export class VirtualFS {
      * constructor
      * @param {string} mountPath
      * @param {boolean} debug
+     * @param {VirtualFSMountOptions} mountOptions Optional mount-time tuning
+     *   (force-unmount, allow-other, display name). Defaults preserve the
+     *   previous hard-coded behaviour.
      */
-    public constructor(private mountPath: string, debug: boolean = false) {
+    public constructor(
+        private mountPath: string,
+        debug: boolean = false,
+        mountOptions: VirtualFSMountOptions = {}
+    ) {
         this._mountPath = mountPath;
         this._debug = debug;
 
+        const {force = true, allowOther = false, name} = mountOptions;
+
         this._fuse = new Fuse(mountPath, {
+            init: this._init.bind(this),
+            error: this._error.bind(this),
             readdir: this._readdir.bind(this),
             getattr: this._getattr.bind(this),
-            setattr: this._setattr.bind(this),
             open: this._open.bind(this),
             read: this._read.bind(this),
             write: this._write.bind(this),
@@ -102,11 +136,25 @@ export class VirtualFS {
             truncate: this._truncate.bind(this),
             ftruncate: this._ftruncate.bind(this),
             access: this._access.bind(this),
-            statfs: this._statfs.bind(this)
+            statfs: this._statfs.bind(this),
+            chmod: this._chmod.bind(this),
+            chown: this._chown.bind(this),
+            utimens: this._utimens.bind(this),
+            flush: this._flush.bind(this),
+            fsync: this._fsync.bind(this),
+            symlink: this._symlink.bind(this),
+            readlink: this._readlink.bind(this),
+            link: this._link.bind(this),
+            mknod: this._mknod.bind(this),
+            getxattr: this._getxattr.bind(this),
+            setxattr: this._setxattr.bind(this),
+            listxattr: this._listxattr.bind(this),
+            removexattr: this._removexattr.bind(this)
         }, {
-            force: true,
+            force: force,
             debug: debug,
-            //allow_other: true,
+            allowOther: allowOther,
+            name: name
         });
     }
 
@@ -172,7 +220,7 @@ export class VirtualFS {
      * @return {{ fs: VirtualFSEntry; relPath: string; }}
      * @private
      */
-    private _resolve(path: string): {
+    protected _resolve(path: string): {
         fs: VirtualFSEntry;
         relPath: string;
     } {
@@ -207,6 +255,24 @@ export class VirtualFS {
     }
 
     /**
+     * init — called once after the FUSE channel is up. Just emits a log line.
+     * @param {(err: number | null) => void} cb
+     */
+    protected _init(cb: (err: number | null) => void): void {
+        this._log(VirtualFSLoggerLevel.log, `init: ${this._mountPath}`);
+        process.nextTick(cb, 0);
+    }
+
+    /**
+     * error — called when fuse-native hits an internal error.
+     * @param {(err: number | null) => void} cb
+     */
+    protected _error(cb: (err: number | null) => void): void {
+        this._log(VirtualFSLoggerLevel.error, `error: ${this._mountPath}`);
+        process.nextTick(cb, 0);
+    }
+
+    /**
      * readdir
      * @param {string} path
      * @param {(err: number | null, names?: string[]) => void} cb
@@ -225,7 +291,7 @@ export class VirtualFS {
             process.nextTick(cb, 0, names);
         } catch (err) {
             this._log(VirtualFSLoggerLevel.error, `READDIR ERROR: ${path}`, err);
-            process.nextTick(cb, Fuse.ENOENT);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.ENOENT));
         }
     }
 
@@ -246,17 +312,7 @@ export class VirtualFS {
 
             process.nextTick(cb, 0, stat);
         } catch(err) {
-            let code = Fuse.ENOENT;
-
-            if (err instanceof ErrnoFuseCb) {
-                code = err.getFuseError();
-            } else if (ErrorUtils.isFsError(err) && typeof err.errno === 'number') {
-                code = err.errno;
-
-                if (err.errno > 0) {
-                    code = -err.errno;
-                }
-            }
+            const code = ErrorUtils.toFuseError(err, Fuse.ENOENT);
 
             this._log(
                 VirtualFSLoggerLevel.debug,
@@ -274,26 +330,16 @@ export class VirtualFS {
      * @param {(err: number | null) => void): Promise<void>} cb
      * @private
      */
-    private async _setattr(path: string, attr: Partial<Stats>, cb: (err: number | null) => void): Promise<void> {
+    protected async _setattr(path: string, attr: Partial<Stats>, cb: (err: number | null) => void): Promise<void> {
         this._log(VirtualFSLoggerLevel.debug, `_setattr call: ${path}`, attr);
 
         try {
             const resolve = this._resolve(path);
-            await resolve.fs.setattr(path, attr);
+            await resolve.fs.setattr(resolve.relPath, attr);
 
             process.nextTick(cb, 0);
         } catch(err) {
-            let code = Fuse.ENOENT;
-
-            if (err instanceof ErrnoFuseCb) {
-                code = err.getFuseError();
-            } else if (ErrorUtils.isFsError(err) && typeof err.errno === 'number') {
-                code = err.errno;
-
-                if (err.errno > 0) {
-                    code = -err.errno;
-                }
-            }
+            const code = ErrorUtils.toFuseError(err, Fuse.ENOENT);
 
             this._log(
                 VirtualFSLoggerLevel.debug,
@@ -302,6 +348,41 @@ export class VirtualFS {
 
             process.nextTick(cb, code);
         }
+    }
+
+    /**
+     * chmod (delegates to setattr({mode}))
+     * @param {string} path
+     * @param {number} mode
+     * @param {(err: number | null) => void} cb
+     */
+    protected _chmod(path: string, mode: number, cb: (err: number | null) => void): Promise<void> {
+        return this._setattr(path, {mode: mode} as Partial<Stats>, cb);
+    }
+
+    /**
+     * chown (delegates to setattr({uid, gid}))
+     * @param {string} path
+     * @param {number} uid
+     * @param {number} gid
+     * @param {(err: number | null) => void} cb
+     */
+    protected _chown(path: string, uid: number, gid: number, cb: (err: number | null) => void): Promise<void> {
+        return this._setattr(path, {uid: uid, gid: gid} as Partial<Stats>, cb);
+    }
+
+    /**
+     * utimens (delegates to setattr({atime, mtime})). Times arrive as ms since epoch.
+     * @param {string} path
+     * @param {number} atime
+     * @param {number} mtime
+     * @param {(err: number | null) => void} cb
+     */
+    protected _utimens(path: string, atime: number, mtime: number, cb: (err: number | null) => void): Promise<void> {
+        return this._setattr(path, {
+            atime: new Date(atime),
+            mtime: new Date(mtime)
+        } as Partial<Stats>, cb);
     }
 
     /**
@@ -319,17 +400,9 @@ export class VirtualFS {
 
             process.nextTick(cb, 0, statefs);
         } catch(err) {
-            if (err instanceof ErrnoFuseCb) {
-                this._log(VirtualFSLoggerLevel.debug, `_statfs error: ${path} -> Fuse-Code: ${err.getFuseError()}`);
-                process.nextTick(cb, err.getFuseError());
-                return;
-            } else if (ErrorUtils.isFsError(err)) {
-                this._log(VirtualFSLoggerLevel.debug, `_statfs error: ${path} -> Code: ${err.code} Syscall: ${err.syscall}`);
-            } else {
-                this._log(VirtualFSLoggerLevel.error, `_statfs error: ${path}`, err);
-            }
-
-            process.nextTick(cb, Fuse.ENOENT);
+            const code = ErrorUtils.toFuseError(err, Fuse.ENOENT);
+            this._log(VirtualFSLoggerLevel.debug, `_statfs error: ${path} -> ${code}`, err);
+            process.nextTick(cb, code);
         }
     }
 
@@ -340,26 +413,18 @@ export class VirtualFS {
      * @param {(err: number | null) => void} cb
      * @private
      */
-    private async _access(path: string, mode: number, cb: (err: number | null) => void): Promise<void> {
+    protected async _access(path: string, mode: number, cb: (err: number | null) => void): Promise<void> {
         this._log(VirtualFSLoggerLevel.debug, `_access call: ${path}`);
 
         try {
             const resolve = this._resolve(path);
-            await resolve.fs.access(path, mode);
+            await resolve.fs.access(resolve.relPath, mode);
 
             process.nextTick(cb, 0);
         } catch(err) {
-            if (err instanceof ErrnoFuseCb) {
-                this._log(VirtualFSLoggerLevel.debug, `_access error: ${path} -> Fuse-Code: ${err.getFuseError()}`);
-                process.nextTick(cb, err.getFuseError());
-                return;
-            } else if (ErrorUtils.isFsError(err)) {
-                this._log(VirtualFSLoggerLevel.debug, `_access error: ${path} -> Code: ${err.code} Syscall: ${err.syscall}`);
-            } else {
-                this._log(VirtualFSLoggerLevel.error, `_access error: ${path}`, err);
-            }
-
-            process.nextTick(cb, Fuse.EACCES);
+            const code = ErrorUtils.toFuseError(err, Fuse.EACCES);
+            this._log(VirtualFSLoggerLevel.debug, `_access error: ${path} -> ${code}`, err);
+            process.nextTick(cb, code);
         }
     }
 
@@ -376,24 +441,33 @@ export class VirtualFS {
             const resolve = this._resolve(path);
             const fd = await resolve.fs.open(resolve.relPath, flags);
 
-            this._statsMap.set(`${path}:${fd}`, {
-                readBytes: 0,
-                writeBytes: 0,
-                readBytesDuration: 0,
-                writeBytesDuration: 0,
-                readBytesTotal: 0,
-                writeBytesTotal: 0,
-                readTimeMs: 0,
-                writeTimeMs: 0,
-                readOps: 0,
-                writeOps: 0
-            });
+            this._initStats(path, fd);
 
             process.nextTick(cb, 0, fd);
         } catch(err) {
             this._log(VirtualFSLoggerLevel.error, 'OPEN ERROR', err);
-            process.nextTick(cb, Fuse.ENOENT);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.ENOENT));
         }
+    }
+
+    /**
+     * Init zero stats for a freshly opened or created handle.
+     * @param {string} path
+     * @param {number} fd
+     */
+    private _initStats(path: string, fd: number): void {
+        this._statsMap.set(`${path}:${fd}`, {
+            readBytes: 0,
+            writeBytes: 0,
+            readBytesDuration: 0,
+            writeBytesDuration: 0,
+            readBytesTotal: 0,
+            writeBytesTotal: 0,
+            readTimeMs: 0,
+            writeTimeMs: 0,
+            readOps: 0,
+            writeOps: 0
+        });
     }
 
     /**
@@ -437,7 +511,7 @@ export class VirtualFS {
             process.nextTick(cb, data.length);
         } catch(err) {
             this._log(VirtualFSLoggerLevel.error, 'READ ERROR', err);
-            process.nextTick(cb, -Fuse.ENOENT);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, -Fuse.ENOENT));
         }
     }
 
@@ -480,7 +554,7 @@ export class VirtualFS {
             process.nextTick(cb, written);
         } catch(err) {
             this._log(VirtualFSLoggerLevel.error, 'WRITE ERROR', err);
-            process.nextTick(cb, -Fuse.ENOENT);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, -Fuse.ENOENT));
         }
     }
 
@@ -490,17 +564,19 @@ export class VirtualFS {
      * @param {number} mode
      * @param {(err: number | null, fd?: number) => void} cb
      */
-    private async _create(path: string, mode: number, cb: (err: number | null, fd?: number) => void): Promise<void> {
+    protected async _create(path: string, mode: number, cb: (err: number | null, fd?: number) => void): Promise<void> {
         this._log(VirtualFSLoggerLevel.debug, `_create call: ${path}`);
 
         try {
             const resolve = this._resolve(path);
             const fd = await resolve.fs.create(resolve.relPath, mode);
 
+            this._initStats(path, fd);
+
             process.nextTick(cb, 0, fd);
         } catch(err) {
             this._log(VirtualFSLoggerLevel.error, 'CREATE ERROR', err);
-            process.nextTick(cb, -Fuse.ENOENT);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.EIO));
         }
     }
 
@@ -519,7 +595,7 @@ export class VirtualFS {
             process.nextTick(cb, 0);
         } catch (err) {
             this._log(VirtualFSLoggerLevel.error, 'UNLINK ERROR', err);
-            process.nextTick(cb, Fuse.ENOENT);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.ENOENT));
         }
     }
 
@@ -539,31 +615,7 @@ export class VirtualFS {
             process.nextTick(cb, 0);
         } catch (err) {
             this._log(VirtualFSLoggerLevel.error, 'MKDIR ERROR', err);
-
-            if (ErrorUtils.isFsError(err)) {
-                switch (err.code) {
-                    case 'EEXIST':
-                        process.nextTick(cb, Fuse.EEXIST);
-                        break;
-
-                    case 'ENOTDIR':
-                        process.nextTick(cb, Fuse.ENOTDIR);
-                        break;
-
-                    case 'ENOENT':
-                        process.nextTick(cb, Fuse.ENOENT);
-                        break;
-
-                    case 'EPERM':
-                        process.nextTick(cb, Fuse.EPERM);
-                        break;
-
-                    default:
-                        process.nextTick(cb, Fuse.EIO);
-                }
-            } else {
-                process.nextTick(cb, Fuse.EIO);
-            }
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.EIO));
         }
     }
 
@@ -582,13 +634,7 @@ export class VirtualFS {
             process.nextTick(cb, 0);
         } catch (err) {
             this._log(VirtualFSLoggerLevel.error, 'RMDIR ERROR', err);
-
-            if (err instanceof ErrnoFuseCb) {
-                process.nextTick(cb, err.getFuseError());
-                return;
-            }
-
-            process.nextTick(cb, Fuse.ENOENT);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.ENOENT));
         }
     }
 
@@ -598,50 +644,203 @@ export class VirtualFS {
      * @param {string} dest
      * @param {(err: number | null) => void} cb
      */
-    private async _rename(src: string, dest: string, cb: (err: number | null) => void): Promise<void> {
+    protected async _rename(src: string, dest: string, cb: (err: number | null) => void): Promise<void> {
         this._log(VirtualFSLoggerLevel.debug, `_rename call: ${src} -> ${dest}`);
 
         try {
-            let tDest = dest;
+            const resolveSrc = this._resolve(src);
+            const resolveDest = this._resolve(dest);
 
-            const resolve = this._resolve(src);
-
-            try {
-                const resolve2 = this._resolve(tDest);
-
-                tDest = resolve2.relPath;
-            } catch {
-                //
+            if (resolveSrc.fs !== resolveDest.fs) {
+                this._log(
+                    VirtualFSLoggerLevel.debug,
+                    `_rename cross-mount refused: ${src} -> ${dest}`
+                );
+                process.nextTick(cb, Fuse.EXDEV);
+                return;
             }
 
-            await resolve.fs.rename(resolve.relPath, tDest);
+            await resolveSrc.fs.rename(resolveSrc.relPath, resolveDest.relPath);
+
+            this._rekeyStatsAfterRename(src, dest);
 
             process.nextTick(cb, 0);
         } catch (err) {
             this._log(VirtualFSLoggerLevel.error, 'RENAME ERROR', err);
-            process.nextTick(cb, Fuse.ENOENT);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.ENOENT));
         }
     }
 
     /**
-     * To fuse error
-     * @param {unknown} err
-     * @return {number}
-     * @protected
+     * Re-key any open stats entries that referenced the source path so they
+     * keep tracking the same fd under the destination path.
+     * @param {string} src
+     * @param {string} dest
      */
-    protected _toFuseError(err: unknown): number {
-        if (typeof err === 'object' && err !== null) {
-            const e = err as { errno?: number; code?: number; };
-            if (typeof e.errno === 'number') {
-                return e.errno;
-            }
+    private _rekeyStatsAfterRename(src: string, dest: string): void {
+        const prefix = `${src}:`;
 
-            if (typeof e.code === 'number') {
-                return e.code;
+        for (const key of [...this._statsMap.keys()]) {
+            if (key.startsWith(prefix)) {
+                const stats = this._statsMap.get(key)!;
+                this._statsMap.delete(key);
+                this._statsMap.set(`${dest}:${key.slice(prefix.length)}`, stats);
             }
         }
+    }
 
-        return -Fuse.ENOENT;
+    /**
+     * symlink — link path is mounted, target is stored verbatim
+     * (it's just a string, not an FS path the kernel walks for us here).
+     * @param {string} target
+     * @param {string} linkPath
+     * @param {(err: number | null) => void} cb
+     */
+    protected async _symlink(target: string, linkPath: string, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_symlink call: ${linkPath} -> ${target}`);
+
+        try {
+            const resolve = this._resolve(linkPath);
+            await resolve.fs.symlink(target, resolve.relPath);
+
+            process.nextTick(cb, 0);
+        } catch (err) {
+            this._log(VirtualFSLoggerLevel.error, 'SYMLINK ERROR', err);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.EIO));
+        }
+    }
+
+    /**
+     * readlink — return the target string of the symlink at path.
+     * @param {string} path
+     * @param {(err: number | null, linkname?: string) => void} cb
+     */
+    protected async _readlink(path: string, cb: (err: number | null, linkname?: string) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_readlink call: ${path}`);
+
+        try {
+            const resolve = this._resolve(path);
+            const target = await resolve.fs.readlink(resolve.relPath);
+
+            process.nextTick(cb, 0, target);
+        } catch (err) {
+            this._log(VirtualFSLoggerLevel.error, 'READLINK ERROR', err);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.ENOENT));
+        }
+    }
+
+    /**
+     * link — hard link. Both src and dest must live in the same mount.
+     * @param {string} src
+     * @param {string} dest
+     * @param {(err: number | null) => void} cb
+     */
+    protected async _link(src: string, dest: string, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_link call: ${src} -> ${dest}`);
+
+        try {
+            const resolveSrc = this._resolve(src);
+            const resolveDest = this._resolve(dest);
+
+            if (resolveSrc.fs !== resolveDest.fs) {
+                this._log(
+                    VirtualFSLoggerLevel.debug,
+                    `_link cross-mount refused: ${src} -> ${dest}`
+                );
+                process.nextTick(cb, Fuse.EXDEV);
+                return;
+            }
+
+            await resolveSrc.fs.link(resolveSrc.relPath, resolveDest.relPath);
+
+            process.nextTick(cb, 0);
+        } catch (err) {
+            this._log(VirtualFSLoggerLevel.error, 'LINK ERROR', err);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.EIO));
+        }
+    }
+
+    /**
+     * Extended attributes are not supported by this filesystem. Returning
+     * ENOSYS lets the kernel cache "no xattr here" instead of repeatedly
+     * asking. All four ops share the same answer.
+     */
+    protected _getxattr(_path: string, _name: string, _position: number, cb: (err: number | null) => void): void {
+        process.nextTick(cb, Fuse.ENOSYS);
+    }
+
+    protected _setxattr(_path: string, _name: string, _value: Buffer, _position: number, _flags: number, cb: (err: number | null) => void): void {
+        process.nextTick(cb, Fuse.ENOSYS);
+    }
+
+    protected _listxattr(_path: string, cb: (err: number | null) => void): void {
+        process.nextTick(cb, Fuse.ENOSYS);
+    }
+
+    protected _removexattr(_path: string, _name: string, cb: (err: number | null) => void): void {
+        process.nextTick(cb, Fuse.ENOSYS);
+    }
+
+    /**
+     * mknod
+     * @param {string} path
+     * @param {number} mode
+     * @param {number} dev
+     * @param {(err: number | null) => void} cb
+     */
+    protected async _mknod(path: string, mode: number, dev: number, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_mknod call: ${path}`);
+
+        try {
+            const resolve = this._resolve(path);
+            await resolve.fs.mknod(resolve.relPath, mode, dev);
+
+            process.nextTick(cb, 0);
+        } catch (err) {
+            this._log(VirtualFSLoggerLevel.error, 'MKNOD ERROR', err);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.EIO));
+        }
+    }
+
+    /**
+     * flush — called per close(2) of a shared fd
+     * @param {string} path
+     * @param {number} fd
+     * @param {(err: number | null) => void} cb
+     */
+    protected async _flush(path: string, fd: number, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_flush call: ${path}`);
+
+        try {
+            const resolve = this._resolve(path);
+            await resolve.fs.flush(resolve.relPath, fd);
+
+            process.nextTick(cb, 0);
+        } catch (err: unknown) {
+            this._log(VirtualFSLoggerLevel.error, 'FLUSH ERROR', err);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.EIO));
+        }
+    }
+
+    /**
+     * fsync / fdatasync
+     * @param {string} path
+     * @param {boolean} datasync true = fdatasync, false = full fsync
+     * @param {number} fd
+     * @param {(err: number | null) => void} cb
+     */
+    protected async _fsync(path: string, datasync: boolean, fd: number, cb: (err: number | null) => void): Promise<void> {
+        this._log(VirtualFSLoggerLevel.debug, `_fsync call: ${path} (datasync=${datasync})`);
+
+        try {
+            const resolve = this._resolve(path);
+            await resolve.fs.fsync(resolve.relPath, fd, datasync);
+
+            process.nextTick(cb, 0);
+        } catch (err: unknown) {
+            this._log(VirtualFSLoggerLevel.error, 'FSYNC ERROR', err);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.EIO));
+        }
     }
 
     /**
@@ -661,73 +860,91 @@ export class VirtualFS {
 
             process.nextTick(cb, 0);
         } catch (err: unknown) {
-            process.nextTick(cb, this._toFuseError(err));
+            this._log(VirtualFSLoggerLevel.error, 'RELEASE ERROR', err);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.EIO));
         }
     }
 
-    private async _truncate(path: string, size: number, cb: (err: number | null) => void): Promise<void> {
+    protected async _truncate(path: string, size: number, cb: (err: number | null) => void): Promise<void> {
         this._log(VirtualFSLoggerLevel.debug, `_truncate call: ${path}`);
 
         try {
             const resolve = this._resolve(path);
-            await resolve.fs.truncate(path, size);
+            await resolve.fs.truncate(resolve.relPath, size);
 
             process.nextTick(cb, 0);
         } catch (err: unknown) {
-            process.nextTick(cb, this._toFuseError(err));
+            this._log(VirtualFSLoggerLevel.error, 'TRUNCATE ERROR', err);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.EIO));
         }
     }
 
-    private async _ftruncate(path: string, fd: number, size: number, cb: (err: number | null) => void): Promise<void> {
+    protected async _ftruncate(path: string, fd: number, size: number, cb: (err: number | null) => void): Promise<void> {
         this._log(VirtualFSLoggerLevel.debug, `_ftruncate call: ${path}`);
 
         try {
             const resolve = this._resolve(path);
-            await resolve.fs.ftruncate(path, fd, size);
+            await resolve.fs.ftruncate(resolve.relPath, fd, size);
 
             process.nextTick(cb, 0);
         } catch (err: unknown) {
-            process.nextTick(cb, this._toFuseError(err));
+            this._log(VirtualFSLoggerLevel.error, 'FTRUNCATE ERROR', err);
+            process.nextTick(cb, ErrorUtils.toFuseError(err, Fuse.EIO));
         }
     }
 
     /**
-     * Mount
-     * @param {boolean} processSigInt
+     * Mount. Returns a Promise that resolves once fuse-native confirms the
+     * mount or rejects on failure. Existing fire-and-forget callers can keep
+     * ignoring the return value.
+     * @param {boolean} processSigInt Install a SIGINT handler that triggers unmount + exit.
+     * @return {Promise<void>}
      */
-    public mount(processSigInt: boolean = true): void {
-        this._fuse.mount(err => {
-            if (err) {
-                this._log(VirtualFSLoggerLevel.error, 'Mount failed', err);
-            } else {
-                this._log(VirtualFSLoggerLevel.log, 'Mounted', this._mountPath);
-            }
-        });
-
+    public mount(processSigInt: boolean = true): Promise<void> {
         if (processSigInt) {
-            process.on('SIGINT', () => this.unmount(true));
+            process.on('SIGINT', () => {
+                this.unmount(true).catch(() => {
+                    // already logged inside unmount; nothing else to do here
+                });
+            });
         }
+
+        return new Promise<void>((resolve, reject) => {
+            this._fuse.mount((err) => {
+                if (err) {
+                    this._log(VirtualFSLoggerLevel.error, 'Mount failed', err);
+                    reject(err instanceof Error ? err : new Error(String(err)));
+                    return;
+                }
+
+                this._log(VirtualFSLoggerLevel.log, 'Mounted', this._mountPath);
+                resolve();
+            });
+        });
     }
 
     /**
-     * Unmount
-     * @param {boolean} processExit
+     * Unmount. Returns a Promise that resolves once fuse-native confirms the
+     * unmount.
+     * @param {boolean} processExit Call process.exit(0) on success.
+     * @return {Promise<void>}
      */
-    public unmount(processExit: boolean = false): void {
-        if (this._fuse === null) {
-            return;
-        }
+    public unmount(processExit: boolean = false): Promise<void> {
+        return new Promise<void>((resolve, reject) => {
+            this._fuse.unmount((err) => {
+                if (err) {
+                    this._log(VirtualFSLoggerLevel.error, 'Unmount failed', err);
+                    reject(err instanceof Error ? err : new Error(String(err)));
+                    return;
+                }
 
-        this._fuse.unmount(err => {
-            if (err) {
-                this._log(VirtualFSLoggerLevel.error, 'Unmount failed', err);
-            } else {
                 this._log(VirtualFSLoggerLevel.log, 'Unmounted', this._mountPath);
-            }
+                resolve();
 
-            if (processExit) {
-                process.exit(0);
-            }
+                if (processExit) {
+                    process.exit(0);
+                }
+            });
         });
     }
 

@@ -1,5 +1,5 @@
 import Fuse, {StatFs} from 'fuse-native';
-import {stat, mkdir, readdir, rename, rmdir, chmod, truncate, utimes, unlink} from 'node:fs/promises';
+import {stat, lstat, mkdir, readdir, rename, rmdir, chmod, chown, truncate, utimes, unlink, symlink, readlink, link} from 'node:fs/promises';
 import tpath from 'path';
 import {ErrnoFuseCb} from '../Error/ErrnoFuseCb.js';
 import {VirtualFSEntry} from './VirtualFSEntry.js';
@@ -160,13 +160,13 @@ export class DirectFS implements VirtualFSEntry {
     }
 
     /**
-     * Get attr
+     * Get attr (uses lstat so symlinks are returned as links, not their targets).
      * @param {string} path
      * @return {Stats}
      */
     public async getattr(path: string): Promise<Stats> {
         const dpath = this._mapPath(path);
-        const st = await stat(dpath);
+        const st = await lstat(dpath);
 
         if (path === '/' && !st.isDirectory()) {
             throw new ErrnoFuseCb(Fuse.ENOTDIR, 'Root is not a directory');
@@ -201,6 +201,14 @@ export class DirectFS implements VirtualFSEntry {
 
         if (attr.size !== undefined) {
             await truncate(dpath, attr.size);
+        }
+
+        if (attr.uid !== undefined || attr.gid !== undefined) {
+            await chown(
+                dpath,
+                attr.uid ?? st.uid,
+                attr.gid ?? st.gid
+            );
         }
 
         if (attr.atime !== undefined || attr.mtime !== undefined) {
@@ -324,6 +332,83 @@ export class DirectFS implements VirtualFSEntry {
         const dpath = this._mapPath(path);
 
         await unlink(dpath);
+    }
+
+    /**
+     * flush — called on every close(2) of a shared fd. No-op; the actual close
+     * happens in release() and any pending data has already gone through write().
+     * @param {string} _path
+     * @param {number} _fd
+     */
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    public async flush(_path: string, _fd: number): Promise<void> {
+        // no-op
+    }
+
+    /**
+     * fsync / fdatasync — flush kernel buffers for this handle to disk.
+     * @param {string} _path
+     * @param {number} fd
+     * @param {boolean} datasync true = fdatasync, false = full fsync
+     */
+    public async fsync(_path: string, fd: number, datasync: boolean): Promise<void> {
+        const {fh} = this._handler.getHandle(fd);
+
+        if (datasync) {
+            await fh.datasync();
+        } else {
+            await fh.sync();
+        }
+    }
+
+    /**
+     * symlink — create a symbolic link at `linkPath` pointing to `target`.
+     * @param {string} target
+     * @param {string} linkPath
+     */
+    public async symlink(target: string, linkPath: string): Promise<void> {
+        await symlink(target, this._mapPath(linkPath));
+    }
+
+    /**
+     * readlink — return the target of the symlink at path.
+     * @param {string} path
+     * @return {string}
+     */
+    public async readlink(path: string): Promise<string> {
+        const target = await readlink(this._mapPath(path));
+        return target.toString();
+    }
+
+    /**
+     * link — hard link `src` to `dest`.
+     * @param {string} src
+     * @param {string} dest
+     */
+    public async link(src: string, dest: string): Promise<void> {
+        await link(this._mapPath(src), this._mapPath(dest));
+    }
+
+    /**
+     * mknod — only regular files (S_IFREG) are supported; everything else gets ENOSYS.
+     * @param {string} path
+     * @param {number} mode
+     * @param {number} _dev
+     */
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    public async mknod(path: string, mode: number, _dev: number): Promise<void> {
+        // eslint-disable-next-line no-bitwise
+        const isRegular = (mode & constants.S_IFMT) === constants.S_IFREG;
+
+        if (!isRegular) {
+            throw new ErrnoFuseCb(Fuse.ENOSYS, 'Only regular files are supported via mknod');
+        }
+
+        const dpath = this._mapPath(path);
+        // eslint-disable-next-line no-bitwise
+        const flags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY;
+        const nativeFH = await fs.open(dpath, flags, mode);
+        await nativeFH.close();
     }
 
     /**
