@@ -3,9 +3,9 @@
 <img src="doc/images/njsfscrypt.png" width="230">
 
 
-NjsFsCrypt mounts one or more folders (with configurable path depth) into another folder. All contents are encrypted using AES-256-GCM, including filenames and folder names, ensuring strong confidentiality. The library can be used directly via the command line, or its classes can be integrated into other applications for custom workflows. Its virtual file system is designed modularly, allowing the creation of additional virtual sub-file systems.
+NjsFsCrypt mounts one or more folders (with configurable path depth) into another folder. All contents are encrypted using AES-256-GCM with a fresh random IV and authentication tag per block, including filenames and folder names, ensuring both confidentiality and integrity. The library can be used directly via the command line, or its classes can be integrated into other applications for custom workflows. Its virtual file system is designed modularly, allowing the creation of additional virtual sub-file systems.
 
-From a security perspective, NjsFsCrypt ensures that both data at rest and metadata (filenames, folder structures) remain encrypted, protecting against unauthorized access or tampering. In terms of utility, it provides a flexible, programmatically accessible encrypted file system that can be embedded into other tools or automated workflows, making it suitable for secure storage, sandboxing, and application-level encryption needs.
+From a security perspective, NjsFsCrypt ensures that both data at rest and metadata (filenames, folder structures) remain encrypted, and that any tampering with the on-disk ciphertext is detected at read time (each block carries its own GCM auth tag bound to its position via AAD). In terms of utility, it provides a flexible, programmatically accessible encrypted file system that can be embedded into other tools or automated workflows, making it suitable for secure storage, sandboxing, and application-level encryption needs.
 
 
 

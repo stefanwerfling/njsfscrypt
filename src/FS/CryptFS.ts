@@ -18,9 +18,31 @@ interface CryptFSOptions {
 
 export class CryptFS implements VirtualFSEntry {
 
-    private static readonly AES_BLOCK = 16;
-    private static readonly NONCE_SIZE = 16;
-    private static readonly META_SIZE = 8 + CryptFS.NONCE_SIZE;
+    /**
+     * Magic prefix written at the start of every CryptFS v2 file. Lets us
+     * detect the format and reject old AES-256-CTR (v1) files instead of
+     * silently producing garbage.
+     */
+    private static readonly MAGIC = Buffer.from('NJSc', 'ascii');
+    private static readonly VERSION = 2;
+
+    /** GCM standard nonce size. */
+    private static readonly IV_SIZE = 12;
+
+    /** GCM standard authentication tag size. */
+    private static readonly TAG_SIZE = 16;
+
+    /**
+     * Header layout: 4 magic + 4 version + 8 filesize + 8 reserved = 24 bytes.
+     */
+    private static readonly META_SIZE = 24;
+    private static readonly HEADER_FILESIZE_OFFSET = 8;
+
+    /**
+     * Each on-disk block has a fresh IV prepended and an auth tag appended,
+     * so on-disk size = plaintext length + BLOCK_OVERHEAD.
+     */
+    private static readonly BLOCK_OVERHEAD = CryptFS.IV_SIZE + CryptFS.TAG_SIZE;
 
     private _options: CryptFSOptions;
 
@@ -72,48 +94,168 @@ export class CryptFS implements VirtualFSEntry {
     }
 
     /**
-     * generate a counter iv for block
-     * @param {Buffer} nonce
-     * @param {bigint} blockCounter
+     * AAD that binds an encrypted block to its index. Reordering or pasting a
+     * block from a different position in the file fails the auth check even
+     * if its on-disk bytes are intact, because the AAD will not match.
+     * @param {number} blockIndex
      * @return {Buffer}
      * @private
      */
-    private _deriveCounterIV(nonce: Buffer, blockCounter: bigint): Buffer {
-        const iv = Buffer.from(nonce);
-        const last = iv.readBigUInt64BE(8);
-        const sum = last + blockCounter;
-
-        iv.writeBigUInt64BE(sum, 8);
-
-        return iv;
+    private _aadFor(blockIndex: number): Buffer {
+        const aad = Buffer.alloc(8);
+        aad.writeBigUInt64BE(BigInt(blockIndex), 0);
+        return aad;
     }
 
     /**
-     * decrypt with CTR
-     * @param {buffer} nonce
-     * @param {bigint} blockCounter
-     * @param {Buffer} ciphertext
-     * @return {Buffer}
-     * @private
-     */
-    private _decryptCTR(nonce: Buffer, blockCounter: bigint, ciphertext: Buffer): Buffer {
-        const iv = this._deriveCounterIV(nonce, blockCounter);
-        const decipher = crypto.createDecipheriv('aes-256-ctr', this._options.encryptionKey, iv);
-        return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-    }
-
-    /**
-     * encrypt with CTR
-     * @param {Buffer} nonce
-     * @param {bigint} blockCounter
+     * Encrypt one plaintext block using AES-256-GCM with a fresh random IV
+     * and the block index bound in as AAD.
+     *
+     * Layout produced: [12 IV][N ciphertext][16 tag], where N === plaintext.length.
+     *
+     * @param {number} blockIndex
      * @param {Buffer} plaintext
      * @return {Buffer}
      * @private
      */
-    private _encryptCTR(nonce: Buffer, blockCounter: bigint, plaintext: Buffer): Buffer {
-        const iv = this._deriveCounterIV(nonce, blockCounter);
-        const cipher = crypto.createCipheriv('aes-256-ctr', this._options.encryptionKey, iv);
-        return Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    private _encryptBlock(blockIndex: number, plaintext: Buffer): Buffer {
+        const iv = crypto.randomBytes(CryptFS.IV_SIZE);
+        const cipher = crypto.createCipheriv('aes-256-gcm', this._options.encryptionKey, iv);
+        cipher.setAAD(this._aadFor(blockIndex));
+
+        const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+        const tag = cipher.getAuthTag();
+
+        return Buffer.concat([iv, ct, tag]);
+    }
+
+    /**
+     * Decrypt and authenticate one on-disk block. Throws if the tag does not
+     * verify (tampering or wrong block index for AAD).
+     *
+     * @param {number} blockIndex
+     * @param {Buffer} onDisk Full block as read from disk: [IV][ct][tag].
+     * @return {Buffer}
+     * @private
+     */
+    private _decryptBlock(blockIndex: number, onDisk: Buffer): Buffer {
+        if (onDisk.length < CryptFS.BLOCK_OVERHEAD) {
+            throw new ErrnoFuseCb(Fuse.EIO, 'CryptFS block truncated below overhead size');
+        }
+
+        const iv = onDisk.subarray(0, CryptFS.IV_SIZE);
+        const tag = onDisk.subarray(onDisk.length - CryptFS.TAG_SIZE);
+        const ct = onDisk.subarray(CryptFS.IV_SIZE, onDisk.length - CryptFS.TAG_SIZE);
+
+        const decipher = crypto.createDecipheriv('aes-256-gcm', this._options.encryptionKey, iv);
+        decipher.setAAD(this._aadFor(blockIndex));
+        decipher.setAuthTag(tag);
+
+        return Buffer.concat([decipher.update(ct), decipher.final()]);
+    }
+
+    /**
+     * Build a fresh header with the supplied filesize.
+     * @param {number} fileSize
+     * @return {Buffer}
+     * @private
+     */
+    private _buildHeader(fileSize: number): Buffer {
+        const buf = Buffer.alloc(CryptFS.META_SIZE);
+        CryptFS.MAGIC.copy(buf, 0);
+        buf.writeUInt32BE(CryptFS.VERSION, 4);
+        buf.writeBigInt64BE(BigInt(fileSize), CryptFS.HEADER_FILESIZE_OFFSET);
+        // bytes 16..24 are reserved zeros
+        return buf;
+    }
+
+    /**
+     * Read and validate the header from the given file handle.
+     * Returns the recorded plaintext file size.
+     *
+     * @param {fs.FileHandle} fh
+     * @return {number}
+     * @private
+     */
+    private async _readHeader(fh: fs.FileHandle): Promise<number> {
+        const buf = Buffer.alloc(CryptFS.META_SIZE);
+        const {bytesRead} = await fh.read(buf, 0, buf.length, 0);
+
+        if (bytesRead < CryptFS.META_SIZE) {
+            throw new ErrnoFuseCb(Fuse.EIO, 'CryptFS file is shorter than the header');
+        }
+
+        if (!buf.subarray(0, 4).equals(CryptFS.MAGIC)) {
+            throw new ErrnoFuseCb(Fuse.EIO, 'CryptFS magic missing — wrong key, corruption, or v1 file');
+        }
+
+        const version = buf.readUInt32BE(4);
+        if (version !== CryptFS.VERSION) {
+            throw new ErrnoFuseCb(Fuse.EIO, `Unsupported CryptFS version ${version}`);
+        }
+
+        return Number(buf.readBigInt64BE(CryptFS.HEADER_FILESIZE_OFFSET));
+    }
+
+    /**
+     * Number of plaintext blocks needed to cover `fileSize` bytes.
+     * @param {number} fileSize
+     * @return {number}
+     * @private
+     */
+    private _numBlocks(fileSize: number): number {
+        if (fileSize <= 0) {
+            return 0;
+        }
+        return Math.ceil(fileSize / this._options.blockSize);
+    }
+
+    /**
+     * Plaintext length stored in block `blockIndex`. Full blocks return
+     * `blockSize`; the trailing block returns the remainder.
+     * @param {number} blockIndex
+     * @param {number} fileSize
+     * @return {number}
+     * @private
+     */
+    private _plainLenOfBlock(blockIndex: number, fileSize: number): number {
+        const numBlocks = this._numBlocks(fileSize);
+        if (blockIndex >= numBlocks) {
+            return 0;
+        }
+        if (blockIndex === numBlocks - 1) {
+            return fileSize - (blockIndex * this._options.blockSize);
+        }
+        return this._options.blockSize;
+    }
+
+    /**
+     * Byte offset on disk where block `blockIndex` starts.
+     * Each preceding block contributes `blockSize + BLOCK_OVERHEAD` bytes.
+     * @param {number} blockIndex
+     * @return {number}
+     * @private
+     */
+    private _blockDiskOffset(blockIndex: number): number {
+        return CryptFS.META_SIZE + blockIndex * (this._options.blockSize + CryptFS.BLOCK_OVERHEAD);
+    }
+
+    /**
+     * Total physical size on disk for a file with the given plaintext size.
+     * @param {number} fileSize
+     * @return {number}
+     * @private
+     */
+    private _physicalSize(fileSize: number): number {
+        const numBlocks = this._numBlocks(fileSize);
+        if (numBlocks === 0) {
+            return CryptFS.META_SIZE;
+        }
+        const fullBlocks = numBlocks - 1;
+        const lastPlain = fileSize - (fullBlocks * this._options.blockSize);
+        return CryptFS.META_SIZE
+            + fullBlocks * (this._options.blockSize + CryptFS.BLOCK_OVERHEAD)
+            + lastPlain + CryptFS.BLOCK_OVERHEAD;
     }
 
     /**
@@ -189,14 +331,8 @@ export class CryptFS implements VirtualFSEntry {
             constants.O_RDWR;
 
         const fh = await fs.open(dpath, flags, mode);
-        const buf = Buffer.alloc(CryptFS.META_SIZE);
 
-        buf.writeBigInt64BE(0n, 0);
-
-        const nonce = crypto.randomBytes(CryptFS.NONCE_SIZE);
-        nonce.copy(buf, 8);
-
-        await fh.write(buf, 0, buf.length, 0);
+        await fh.write(this._buildHeader(0), 0, CryptFS.META_SIZE, 0);
 
         return this._handler.allocHandle({
             fh: fh,
@@ -273,12 +409,8 @@ export class CryptFS implements VirtualFSEntry {
 
         if (tstat.size >= CryptFS.META_SIZE) {
             const fh = await fs.open(fullPath, 'r');
-
             try {
-                const buf = Buffer.alloc(8);
-                await fh.read(buf, 0, 8, 0);
-
-                fileSize = Number(buf.readBigInt64BE(0));
+                fileSize = await this._readHeader(fh);
             } finally {
                 await fh.close();
             }
@@ -376,25 +508,13 @@ export class CryptFS implements VirtualFSEntry {
      * @return {Buffer}
      */
     public async read(path: string, fd: number, length: number, offset: number): Promise<Buffer> {
-        const { fh } = this._handler.getHandle(fd);
+        const {fh} = this._handler.getHandle(fd);
 
         if (!fh) {
             throw new Error(`Filehandle not found: ${fd}`);
         }
 
-        /**
-         * Read header
-         */
-
-        const header = Buffer.alloc(CryptFS.META_SIZE);
-        const { bytesRead: headRead } = await fh.read(header, 0, header.length, 0);
-
-        if (headRead < CryptFS.META_SIZE) {
-            return Buffer.alloc(0);
-        }
-
-        const fileSize = Number(header.readBigInt64BE(0));
-        const nonce = header.subarray(8, 8 + CryptFS.NONCE_SIZE);
+        const fileSize = await this._readHeader(fh);
 
         if (offset >= fileSize) {
             return Buffer.alloc(0);
@@ -403,73 +523,34 @@ export class CryptFS implements VirtualFSEntry {
         const toReadTotal = Math.min(length, fileSize - offset);
         const out = Buffer.alloc(toReadTotal);
 
-        /**
-         * calculate block range
-         */
-
         const firstBlock = Math.floor(offset / this._options.blockSize);
-        const lastBlock  = Math.floor((offset + toReadTotal - 1) / this._options.blockSize);
+        const lastBlock = Math.floor((offset + toReadTotal - 1) / this._options.blockSize);
 
         let done = 0;
 
-        /**
-         * Read block
-         */
-
         for (let block = firstBlock; block <= lastBlock; block++) {
             const blockPlainStart = block * this._options.blockSize;
-            const blockPlainEnd   = blockPlainStart + this._options.blockSize;
+            const plainLen = this._plainLenOfBlock(block, fileSize);
+            const onDiskLen = plainLen + CryptFS.BLOCK_OVERHEAD;
+            const onDiskOffset = this._blockDiskOffset(block);
 
-            const readStart = Math.max(offset, blockPlainStart);
-            const readEnd   = Math.min(offset + toReadTotal, blockPlainEnd);
-
-            const readLenInBlock = readEnd - readStart;
-            const readOffsetInBlock = readStart - blockPlainStart;
-
-            const counterBlockStart =
-                Math.floor(blockPlainStart / CryptFS.AES_BLOCK) * CryptFS.AES_BLOCK;
-
-            const cipherFilePos = CryptFS.META_SIZE + counterBlockStart;
-
-            const neededPlainBytes =
-                blockPlainEnd - counterBlockStart;
-
-            const cipherReadLen =
-                Math.ceil(neededPlainBytes / CryptFS.AES_BLOCK) * CryptFS.AES_BLOCK;
-
-            // read chipher --------------------------------------------------------------------------------------------
-
-            const encBuf = Buffer.alloc(cipherReadLen);
+            const onDiskBuf = Buffer.alloc(onDiskLen);
             // eslint-disable-next-line no-await-in-loop
-            const { bytesRead } = await fh.read(
-                encBuf,
-                0,
-                cipherReadLen,
-                cipherFilePos
-            );
+            const {bytesRead} = await fh.read(onDiskBuf, 0, onDiskLen, onDiskOffset);
 
-            if (bytesRead < cipherReadLen) {
-                encBuf.fill(0, bytesRead);
+            if (bytesRead < onDiskLen) {
+                throw new ErrnoFuseCb(Fuse.EIO, `CryptFS block ${block} truncated on disk`);
             }
 
-            // decrypt -------------------------------------------------------------------------------------------------
+            // eslint-disable-next-line no-await-in-loop
+            const plain = this._decryptBlock(block, onDiskBuf);
 
-            const plain = this._decryptCTR(
-                nonce,
-                BigInt(counterBlockStart / CryptFS.AES_BLOCK),
-                encBuf
-            );
+            // copy the relevant slice of this plaintext block into the output
+            const sliceStart = Math.max(offset, blockPlainStart) - blockPlainStart;
+            const sliceEnd = Math.min(offset + toReadTotal, blockPlainStart + plainLen) - blockPlainStart;
 
-            // copy slice ----------------------------------------------------------------------------------------------
-
-            plain.copy(
-                out,
-                done,
-                readOffsetInBlock,
-                readOffsetInBlock + readLenInBlock
-            );
-
-            done += readLenInBlock;
+            plain.copy(out, done, sliceStart, sliceEnd);
+            done += sliceEnd - sliceStart;
         }
 
         return out;
@@ -612,8 +693,7 @@ export class CryptFS implements VirtualFSEntry {
 
     /**
      * link — hard link two encoded names onto the same encrypted inode. The
-     * ciphertext (incl. header/nonce) is identical for both paths; the
-     * filenames differ only in their on-disk encoded form.
+     * encrypted file (header + per-block IVs/tags) is shared by both names.
      * @param {string} src
      * @param {string} dest
      */
@@ -648,14 +728,82 @@ export class CryptFS implements VirtualFSEntry {
         const fh = await fs.open(dpath, flags, mode);
 
         try {
-            const buf = Buffer.alloc(CryptFS.META_SIZE);
-            buf.writeBigInt64BE(0n, 0);
-            const nonce = crypto.randomBytes(CryptFS.NONCE_SIZE);
-            nonce.copy(buf, 8);
-            await fh.write(buf, 0, buf.length, 0);
+            await fh.write(this._buildHeader(0), 0, CryptFS.META_SIZE, 0);
         } finally {
             await fh.close();
         }
+    }
+
+    /**
+     * Shared resize implementation used by truncate() and ftruncate().
+     * Re-encrypts the boundary block(s) when shrinking lands mid-block or
+     * when extending grows past the old (possibly partial) trailing block.
+     *
+     * @param {fs.FileHandle} fh
+     * @param {number} newSize
+     * @private
+     */
+    private async _resize(fh: fs.FileHandle, newSize: number): Promise<void> {
+        const oldSize = await this._readHeader(fh);
+
+        if (newSize === oldSize) {
+            return;
+        }
+
+        const oldNumBlocks = this._numBlocks(oldSize);
+        const newNumBlocks = this._numBlocks(newSize);
+
+        if (newSize < oldSize) {
+            // Shrink: re-encrypt the new last block if shrinking mid-block.
+            if (newNumBlocks > 0) {
+                const lastBlock = newNumBlocks - 1;
+                const oldPlainLen = this._plainLenOfBlock(lastBlock, oldSize);
+                const newPlainLen = this._plainLenOfBlock(lastBlock, newSize);
+
+                if (newPlainLen < oldPlainLen) {
+                    const onDiskLen = oldPlainLen + CryptFS.BLOCK_OVERHEAD;
+                    const onDiskBuf = Buffer.alloc(onDiskLen);
+                    await fh.read(onDiskBuf, 0, onDiskLen, this._blockDiskOffset(lastBlock));
+                    const plain = this._decryptBlock(lastBlock, onDiskBuf);
+                    const truncated = plain.subarray(0, newPlainLen);
+                    const encrypted = this._encryptBlock(lastBlock, truncated);
+                    await fh.write(encrypted, 0, encrypted.length, this._blockDiskOffset(lastBlock));
+                }
+            }
+            await fh.truncate(this._physicalSize(newSize));
+        } else {
+            // Extend: pad/grow the old trailing block to a full block (if it
+            // was partial) and append zero-filled blocks up to the new size.
+            const startBlock = oldNumBlocks > 0 ? oldNumBlocks - 1 : 0;
+            for (let block = startBlock; block < newNumBlocks; block++) {
+                const newPlainLen = this._plainLenOfBlock(block, newSize);
+
+                let existing: Buffer;
+                if (block < oldNumBlocks) {
+                    const existingOnDiskLen =
+                        this._plainLenOfBlock(block, oldSize) + CryptFS.BLOCK_OVERHEAD;
+                    const onDiskBuf = Buffer.alloc(existingOnDiskLen);
+                    // eslint-disable-next-line no-await-in-loop
+                    await fh.read(onDiskBuf, 0, existingOnDiskLen, this._blockDiskOffset(block));
+                    // eslint-disable-next-line no-await-in-loop
+                    existing = this._decryptBlock(block, onDiskBuf);
+                } else {
+                    existing = Buffer.alloc(0);
+                }
+
+                const newPlain = Buffer.alloc(newPlainLen);
+                existing.copy(newPlain, 0, 0, Math.min(existing.length, newPlainLen));
+
+                const encrypted = this._encryptBlock(block, newPlain);
+                // eslint-disable-next-line no-await-in-loop
+                await fh.write(encrypted, 0, encrypted.length, this._blockDiskOffset(block));
+            }
+        }
+
+        // Update filesize in header.
+        const sizeBuf = Buffer.alloc(8);
+        sizeBuf.writeBigInt64BE(BigInt(newSize), 0);
+        await fh.write(sizeBuf, 0, 8, CryptFS.HEADER_FILESIZE_OFFSET);
     }
 
     /**
@@ -664,17 +812,13 @@ export class CryptFS implements VirtualFSEntry {
      * @param {number} size
      */
     public async truncate(path: string, size: number): Promise<void> {
+        if (size < 0) {
+            throw new ErrnoFuseCb(Fuse.EINVAL);
+        }
+
         const fh = await fs.open(this._mapPath(path), 'r+');
         try {
-            const header = Buffer.alloc(CryptFS.META_SIZE);
-            await fh.read(header, 0, header.length, 0);
-
-            const sizeBuf = Buffer.alloc(8);
-            sizeBuf.writeBigInt64BE(BigInt(size), 0);
-            await fh.write(sizeBuf, 0, 8, 0);
-
-            const blocks = Math.ceil(size / CryptFS.AES_BLOCK);
-            await fh.truncate(CryptFS.META_SIZE + (blocks * CryptFS.AES_BLOCK));
+            await this._resize(fh, size);
         } finally {
             await fh.close();
         }
@@ -687,7 +831,7 @@ export class CryptFS implements VirtualFSEntry {
      * @param {number} size
      */
     public async ftruncate(path: string, fd: number, size: number): Promise<void> {
-        const { fh } = this._handler.getHandle(fd);
+        const {fh} = this._handler.getHandle(fd);
 
         if (!fh) {
             throw new ErrnoFuseCb(Fuse.EBADF);
@@ -697,26 +841,7 @@ export class CryptFS implements VirtualFSEntry {
             throw new ErrnoFuseCb(Fuse.EINVAL);
         }
 
-        const header = Buffer.alloc(CryptFS.META_SIZE);
-        await fh.read(header, 0, header.length, 0);
-
-        // create new header -------------------------------------------------------------------------------------------
-
-        const sizeBuf = Buffer.alloc(8);
-        sizeBuf.writeBigInt64BE(BigInt(size), 0);
-        await fh.write(sizeBuf, 0, 8, 0);
-
-        // -------------------------------------------------------------------------------------------------------------
-
-        const blocks = Math.ceil(size / CryptFS.AES_BLOCK);
-        const newPhysicalSize =
-            CryptFS.META_SIZE + (blocks * CryptFS.AES_BLOCK);
-
-        const st = await fh.stat();
-
-        if (newPhysicalSize < st.size) {
-            await fh.truncate(newPhysicalSize);
-        }
+        await this._resize(fh, size);
     }
 
     /**
@@ -728,7 +853,7 @@ export class CryptFS implements VirtualFSEntry {
      * @return {number}
      */
     public async write(path: string, fd: number, buffer: Buffer, offset: number): Promise<number> {
-        const { fh } = this._handler.getHandle(fd);
+        const {fh} = this._handler.getHandle(fd);
 
         if (!fh) {
             throw new Error(`Filehandle not found ${fd}`);
@@ -737,137 +862,84 @@ export class CryptFS implements VirtualFSEntry {
         const writeLen = buffer.length;
         const writeEnd = offset + writeLen;
 
-        /**
-         * Header read or init
-         */
-
-        const header = Buffer.alloc(CryptFS.META_SIZE);
-        let fileSize = 0;
-        let nonce: Buffer;
-
-        const st = await fh.stat();
-
-        if (st.size < CryptFS.META_SIZE) {
-            nonce = crypto.randomBytes(CryptFS.NONCE_SIZE);
-            header.writeBigInt64BE(0n, 0);
-            nonce.copy(header, 8);
-
-            await fh.write(header, 0, header.length, 0);
-        } else {
-            await fh.read(header, 0, header.length, 0);
-
-            fileSize = Number(header.readBigInt64BE(0));
-            nonce = header.subarray(8, 8 + CryptFS.NONCE_SIZE);
-        }
-
-        /**
-         * New filesize
-         */
+        const fileSize = await this._readHeader(fh);
+        const oldNumBlocks = this._numBlocks(fileSize);
+        const oldLastBlock = oldNumBlocks - 1;
+        const oldLastPlainLen = oldLastBlock >= 0
+            ? fileSize - (oldLastBlock * this._options.blockSize)
+            : 0;
 
         const newFileSize = Math.max(fileSize, writeEnd);
+        const newNumBlocks = this._numBlocks(newFileSize);
+        const newLastBlock = newNumBlocks - 1;
 
-        /**
-         * get plain block
-         */
+        const firstTouched = Math.floor(offset / this._options.blockSize);
+        const lastTouched = Math.floor((writeEnd - 1) / this._options.blockSize);
 
-        const firstBlock = Math.floor(offset / this._options.blockSize);
-        const lastBlock  = Math.floor((writeEnd - 1) / this._options.blockSize);
-
-        let bytesWritten = 0;
-
-        /**
-         * block read
-         */
-
-        for (let block = firstBlock; block <= lastBlock; block++) {
-            const blockPlainStart = block * this._options.blockSize;
-            const blockPlainEnd   = blockPlainStart + this._options.blockSize;
-
-            const writeStart = Math.max(offset, blockPlainStart);
-            const writeEndInBlock = Math.min(writeEnd, blockPlainEnd);
-
-            const writeLenInBlock = writeEndInBlock - writeStart;
-            const writeOffsetInBlock = writeStart - blockPlainStart;
-
-            // cipher offset (CTR Counter) -----------------------------------------------------------------------------
-
-            const counterBlockStart =
-                Math.floor(blockPlainStart / CryptFS.AES_BLOCK) * CryptFS.AES_BLOCK;
-
-            const cipherFilePos = CryptFS.META_SIZE + counterBlockStart;
-
-            // how much? -----------------------------------------------------------------------------------------------
-
-            const neededPlainBytes =
-                Math.max(blockPlainEnd, writeEnd) - counterBlockStart;
-
-            const cipherReadLen =
-                Math.ceil(neededPlainBytes / CryptFS.AES_BLOCK) * CryptFS.AES_BLOCK;
-
-            // chipher read --------------------------------------------------------------------------------------------
-
-            const encBuf = Buffer.alloc(cipherReadLen);
-
-            // eslint-disable-next-line no-await-in-loop
-            const { bytesRead } = await fh.read(
-                encBuf,
-                0,
-                cipherReadLen,
-                cipherFilePos
-            );
-
-            if (bytesRead < cipherReadLen) {
-                encBuf.fill(0, bytesRead);
-            }
-
-            // decrypt -------------------------------------------------------------------------------------------------
-
-            let plain = this._decryptCTR(
-                nonce,
-                BigInt(counterBlockStart / CryptFS.AES_BLOCK),
-                encBuf
-            );
-
-            // new block add -------------------------------------------------------------------------------------------
-
-            if (plain.length < cipherReadLen) {
-                const tmp = Buffer.alloc(cipherReadLen);
-                plain.copy(tmp);
-                plain = tmp;
-            }
-
-            // new data write ------------------------------------------------------------------------------------------
-
-            buffer.copy(
-                plain,
-                writeOffsetInBlock,
-                bytesWritten,
-                bytesWritten + writeLenInBlock
-            );
-
-            bytesWritten += writeLenInBlock;
-
-            // encrypt -------------------------------------------------------------------------------------------------
-
-            const encNew = this._encryptCTR(
-                nonce,
-                BigInt(counterBlockStart / CryptFS.AES_BLOCK),
-                plain
-            );
-
-            // write to file -------------------------------------------------------------------------------------------
-
-            // eslint-disable-next-line no-await-in-loop
-            await fh.write(encNew, 0, encNew.length, cipherFilePos);
+        // If the file grows past an old partial trailing block, that block is
+        // no longer the trailing block — it must be re-encrypted as a full
+        // blockSize block.
+        let firstAffected = firstTouched;
+        if (
+            oldLastBlock >= 0 &&
+            oldLastPlainLen < this._options.blockSize &&
+            newLastBlock > oldLastBlock &&
+            oldLastBlock < firstTouched
+        ) {
+            firstAffected = oldLastBlock;
         }
 
-        /**
-         * add new filesize to header and write
-         */
+        const lastAffected = Math.max(lastTouched, newLastBlock);
+        let bytesWritten = 0;
 
+        for (let block = firstAffected; block <= lastAffected; block++) {
+            const blockPlainStart = block * this._options.blockSize;
+            const newBlockPlainLen = this._plainLenOfBlock(block, newFileSize);
+
+            // Existing plaintext for this block (zero-padded if it didn't
+            // exist yet, or read+verified from disk otherwise).
+            let existing: Buffer;
+            if (block < oldNumBlocks) {
+                const existingOnDiskLen =
+                    this._plainLenOfBlock(block, fileSize) + CryptFS.BLOCK_OVERHEAD;
+                const onDiskBuf = Buffer.alloc(existingOnDiskLen);
+                // eslint-disable-next-line no-await-in-loop
+                const {bytesRead} = await fh.read(
+                    onDiskBuf, 0, existingOnDiskLen, this._blockDiskOffset(block)
+                );
+                if (bytesRead < existingOnDiskLen) {
+                    throw new ErrnoFuseCb(Fuse.EIO, `CryptFS block ${block} truncated on disk`);
+                }
+                // eslint-disable-next-line no-await-in-loop
+                existing = this._decryptBlock(block, onDiskBuf);
+            } else {
+                existing = Buffer.alloc(0);
+            }
+
+            // Build the post-write plaintext for this block.
+            const newPlain = Buffer.alloc(newBlockPlainLen);
+            existing.copy(newPlain, 0, 0, Math.min(existing.length, newBlockPlainLen));
+
+            const sliceStart = Math.max(offset, blockPlainStart);
+            const sliceEnd = Math.min(writeEnd, blockPlainStart + this._options.blockSize);
+
+            if (sliceStart < sliceEnd) {
+                const srcStart = sliceStart - offset;
+                const dstStart = sliceStart - blockPlainStart;
+                const copyLen = sliceEnd - sliceStart;
+                buffer.copy(newPlain, dstStart, srcStart, srcStart + copyLen);
+                bytesWritten += copyLen;
+            }
+
+            const encrypted = this._encryptBlock(block, newPlain);
+            // eslint-disable-next-line no-await-in-loop
+            await fh.write(encrypted, 0, encrypted.length, this._blockDiskOffset(block));
+        }
+
+        // Header: only filesize changes, magic+version stay.
         const sizeBuf = Buffer.alloc(8);
         sizeBuf.writeBigInt64BE(BigInt(newFileSize), 0);
-        await fh.write(sizeBuf, 0, 8, 0);
+        await fh.write(sizeBuf, 0, 8, CryptFS.HEADER_FILESIZE_OFFSET);
 
         return bytesWritten;
     }

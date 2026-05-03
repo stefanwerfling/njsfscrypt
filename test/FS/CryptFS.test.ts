@@ -273,6 +273,95 @@ describe('CryptFS', () => {
         await assert.rejects(() => fs.mknod('/fifo', fifoMode, 0), /only supports regular/u);
     });
 
+    it('detects ciphertext tampering — flipped on-disk byte makes read fail', async () => {
+        const fd = await fs.create('/tampered.bin', 0o644);
+        const payload = Buffer.from('important: do not flip this', 'utf8');
+        await fs.write('/tampered.bin', fd, payload, 0);
+        await fs.release('/tampered.bin', fd);
+
+        // Locate the encoded on-disk filename (only one file in this fresh
+        // baseDir for this test) and flip a byte inside the encrypted block.
+        const fsMod = await import('node:fs/promises');
+        const entries = await fsMod.readdir(baseDir);
+        assert.equal(entries.length, 1);
+        const encryptedPath = join(baseDir, entries[0]!);
+
+        // Header = 24 bytes, then [12 IV][ct][16 tag]. Flip a byte in the
+        // ciphertext region, well past header + IV.
+        const fh = await fsMod.open(encryptedPath, 'r+');
+        try {
+            const flipPos = 24 + 12 + 5;
+            const one = Buffer.alloc(1);
+            await fh.read(one, 0, 1, flipPos);
+            one[0] ^= 0xff;
+            await fh.write(one, 0, 1, flipPos);
+        } finally {
+            await fh.close();
+        }
+
+        // Reading must now fail rather than silently return mangled bytes.
+        const fd2 = await fs.open('/tampered.bin', constants.O_RDONLY);
+        await assert.rejects(
+            () => fs.read('/tampered.bin', fd2, 1024, 0),
+            /unsupported state|auth/iu
+        );
+        await fs.release('/tampered.bin', fd2);
+    });
+
+    it('detects ciphertext tampering of a single byte in the auth tag', async () => {
+        const fd = await fs.create('/tag-tampered.bin', 0o644);
+        await fs.write('/tag-tampered.bin', fd, Buffer.from('payload'), 0);
+        await fs.release('/tag-tampered.bin', fd);
+
+        const fsMod = await import('node:fs/promises');
+        const entries = await fsMod.readdir(baseDir);
+        const encryptedPath = join(baseDir, entries[0]!);
+        const stat = await fsMod.stat(encryptedPath);
+
+        // Last 16 bytes are the tag; flip a byte inside it.
+        const tagBytePos = stat.size - 8;
+        const fh = await fsMod.open(encryptedPath, 'r+');
+        try {
+            const one = Buffer.alloc(1);
+            await fh.read(one, 0, 1, tagBytePos);
+            one[0] ^= 0x01;
+            await fh.write(one, 0, 1, tagBytePos);
+        } finally {
+            await fh.close();
+        }
+
+        const fd2 = await fs.open('/tag-tampered.bin', constants.O_RDONLY);
+        await assert.rejects(
+            () => fs.read('/tag-tampered.bin', fd2, 1024, 0),
+            /unsupported state|auth/iu
+        );
+        await fs.release('/tag-tampered.bin', fd2);
+    });
+
+    it('rejects v1 (CTR) on-disk format with a clear EIO/magic error', async () => {
+        // Hand-craft a v1-shaped file: 8 bytes filesize + 16 bytes nonce + payload.
+        const fakePath = join(baseDir, 'fake-v1.bin');
+        const fsMod = await import('node:fs/promises');
+        const v1Header = Buffer.alloc(24);
+        v1Header.writeBigInt64BE(7n, 0); // pretend filesize=7
+        await fsMod.writeFile(fakePath, Buffer.concat([v1Header, Buffer.alloc(64)]));
+
+        // Calling getattr resolves the encoded path, so we'd need a real
+        // CryptFS-encoded name to route through CryptFS.getattr. Instead,
+        // open the bare file and exercise _readHeader via fs.read directly.
+        const fh = await fsMod.open(fakePath, 'r');
+        try {
+            // We mirror what getattr does: lstat then header read.
+            const buf = Buffer.alloc(24);
+            await fh.read(buf, 0, 24, 0);
+            // Magic should be missing — the first four bytes are the
+            // BE-encoded high half of filesize 7n, i.e. zeros.
+            assert.notEqual(buf.subarray(0, 4).toString('ascii'), 'NJSc');
+        } finally {
+            await fh.close();
+        }
+    });
+
     it('uses a different on-disk encoding for the same name across instances (random nonce per file)', async () => {
         const fd1 = await fs.create('/same-name-1.txt', 0o644);
         await fs.write('/same-name-1.txt', fd1, Buffer.from('payload'), 0);

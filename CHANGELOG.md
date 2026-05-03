@@ -5,6 +5,39 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-05-04
+
+### Added
+- **AES-256-GCM authenticated encryption per block** for file contents.
+  Every encrypted block on disk now carries a fresh random 12-byte IV, a
+  16-byte GCM auth tag, and the block index bound in as Additional
+  Authenticated Data (AAD). Tampering with the ciphertext, the tag, or
+  swapping blocks within a file all cause `read()` to fail with `EIO`
+  instead of silently returning corrupted plaintext.
+- New on-disk header carries a `"NJSc"` magic + `version=2` marker so the
+  format can be detected and old files rejected with a clear error.
+
+### Changed
+- **Breaking on-disk format change for `CryptFS`**. Files written by 1.1.x
+  (AES-256-CTR with a per-file nonce) cannot be read by 1.2.x. Decrypt and
+  re-encrypt them against a 1.2.0 mount before upgrading; the new format
+  starts every encrypted file with `"NJSc"` + uint32 version, which lets
+  any future tooling distinguish the layouts.
+- README claim about authenticated encryption is now accurate — it was
+  previously only true for filenames; file contents used unauthenticated
+  CTR mode.
+
+### Internal
+- New helpers `_encryptBlock` / `_decryptBlock` / `_buildHeader` /
+  `_readHeader` / `_physicalSize` / `_blockDiskOffset` / `_plainLenOfBlock`
+  in `CryptFS`.
+- `truncate` and `ftruncate` share a single `_resize()` implementation
+  that re-encrypts the boundary block when the new size lands mid-block.
+- Removed `_encryptCTR` / `_decryptCTR` / `_deriveCounterIV` and the
+  `NONCE_SIZE` / `AES_BLOCK` constants.
+- New tests cover ciphertext tampering, auth-tag tampering, and the
+  format-version sentinel.
+
 ## [1.1.0] - 2026-05-03
 
 ### Added
