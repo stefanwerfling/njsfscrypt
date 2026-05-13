@@ -39,6 +39,30 @@ export interface VirtualFSMountOptions {
      * Display name for the mount (shown by `mount` / Finder etc.).
      */
     name?: string;
+
+    /**
+     * Trust the kernel page cache indefinitely. Re-reads of unchanged files
+     * never enter our `read()` op — a large win for read-heavy workloads
+     * like media playback. Only safe when nothing modifies `baseDir`
+     * outside this mount, since external writes won't invalidate the cache.
+     */
+    kernelCache?: boolean;
+
+    /**
+     * Like `kernelCache` but invalidates per file when `mtime` or `size`
+     * change between opens. Safer default when external writes to
+     * `baseDir` are possible; still skips the `read()` op for cached pages
+     * within a single open.
+     */
+    autoCache?: boolean;
+
+    /**
+     * Maximum size of a single FUSE read request, in bytes. Larger values
+     * mean fewer round-trips per `cat`/`dd`/playback read. Typical tuning
+     * is 128 KiB. `maxWrite` is not exposed by fuse-native and cannot be
+     * configured here.
+     */
+    maxRead?: number;
 }
 
 /**
@@ -117,7 +141,14 @@ export class VirtualFS {
         this._mountPath = mountPath;
         this._debug = debug;
 
-        const {force = true, allowOther = false, name} = mountOptions;
+        const {
+            force = true,
+            allowOther = false,
+            name,
+            kernelCache,
+            autoCache,
+            maxRead
+        } = mountOptions;
 
         this._fuse = new Fuse(mountPath, {
             init: this._init.bind(this),
@@ -154,7 +185,10 @@ export class VirtualFS {
             force: force,
             debug: debug,
             allowOther: allowOther,
-            name: name
+            name: name,
+            kernelCache: kernelCache,
+            autoCache: autoCache,
+            maxRead: maxRead
         });
     }
 

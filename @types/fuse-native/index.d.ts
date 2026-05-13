@@ -233,6 +233,9 @@ declare module 'fuse-native' {
         allowOther?: boolean;
         name?: string;
         allow_other?: boolean;
+        kernelCache?: boolean;
+        autoCache?: boolean;
+        maxRead?: number;
     }
 
     export default class Fuse {

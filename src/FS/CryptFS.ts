@@ -64,6 +64,17 @@ export class CryptFS implements VirtualFSEntry {
      */
     private _isInit: boolean = false;
 
+
+    /**
+     * Per-fd cache of the plaintext file size held in the header. Avoids a
+     * header-read syscall on every `read()`/`write()` and a header-write
+     * syscall on every `write()`. The dirty flag tracks whether the
+     * in-memory size has grown past the on-disk header; the persist happens
+     * in `release()` / `fsync()`.
+     * @private
+     */
+    private _metaCache: Map<number, {fileSize: number; dirty: boolean;}> = new Map();
+
     /**
      * constructor
      * @param {CryptFSOptions} options
@@ -195,6 +206,48 @@ export class CryptFS implements VirtualFSEntry {
         }
 
         return Number(buf.readBigInt64BE(CryptFS.HEADER_FILESIZE_OFFSET));
+    }
+
+    /**
+     * Return the plaintext file size for a given fd, reading and caching
+     * the header on first use.
+     * @param {number} fd
+     * @param {fs.FileHandle} fh
+     * @return {number}
+     * @private
+     */
+    private async _getCachedFileSize(fd: number, fh: fs.FileHandle): Promise<number> {
+        const entry = this._metaCache.get(fd);
+
+        if (entry) {
+            return entry.fileSize;
+        }
+
+        const fileSize = await this._readHeader(fh);
+        this._metaCache.set(fd, {fileSize: fileSize, dirty: false});
+
+        return fileSize;
+    }
+
+    /**
+     * Flush the cached filesize back into the on-disk header if it has
+     * grown since the last persist. Only the 8-byte filesize field is
+     * touched — magic and version stay intact.
+     * @param {number} fd
+     * @param {fs.FileHandle} fh
+     * @private
+     */
+    private async _flushFileSizeIfDirty(fd: number, fh: fs.FileHandle): Promise<void> {
+        const entry = this._metaCache.get(fd);
+
+        if (!entry || !entry.dirty) {
+            return;
+        }
+
+        const sizeBuf = Buffer.alloc(8);
+        sizeBuf.writeBigInt64BE(BigInt(entry.fileSize), 0);
+        await fh.write(sizeBuf, 0, 8, CryptFS.HEADER_FILESIZE_OFFSET);
+        entry.dirty = false;
     }
 
     /**
@@ -334,12 +387,18 @@ export class CryptFS implements VirtualFSEntry {
 
         await fh.write(this._buildHeader(0), 0, CryptFS.META_SIZE, 0);
 
-        return this._handler.allocHandle({
+        const vfd = this._handler.allocHandle({
             fh: fh,
             path: path,
             realPath: dpath,
             flags: flags
         });
+
+        // Header was just written with filesize=0 — prime the cache so the
+        // first read/write doesn't re-read it.
+        this._metaCache.set(vfd, {fileSize: 0, dirty: false});
+
+        return vfd;
     }
 
     /**
@@ -514,7 +573,7 @@ export class CryptFS implements VirtualFSEntry {
             throw new Error(`Filehandle not found: ${fd}`);
         }
 
-        const fileSize = await this._readHeader(fh);
+        const fileSize = await this._getCachedFileSize(fd, fh);
 
         if (offset >= fileSize) {
             return Buffer.alloc(0);
@@ -526,31 +585,39 @@ export class CryptFS implements VirtualFSEntry {
         const firstBlock = Math.floor(offset / this._options.blockSize);
         const lastBlock = Math.floor((offset + toReadTotal - 1) / this._options.blockSize);
 
+        // Blocks are contiguous on disk, so the whole touched range is one
+        // syscall. Cipher work stays per-block (GCM = per-block IV + tag).
+        const readStart = this._blockDiskOffset(firstBlock);
+        const lastBlockOnDiskLen =
+            this._plainLenOfBlock(lastBlock, fileSize) + CryptFS.BLOCK_OVERHEAD;
+        const readLen = this._blockDiskOffset(lastBlock) + lastBlockOnDiskLen - readStart;
+
+        const onDiskBuf = Buffer.alloc(readLen);
+        const {bytesRead} = await fh.read(onDiskBuf, 0, readLen, readStart);
+
+        if (bytesRead < readLen) {
+            throw new ErrnoFuseCb(Fuse.EIO, 'CryptFS block range truncated on disk');
+        }
+
         let done = 0;
+        let cursor = 0;
 
         for (let block = firstBlock; block <= lastBlock; block++) {
             const blockPlainStart = block * this._options.blockSize;
             const plainLen = this._plainLenOfBlock(block, fileSize);
             const onDiskLen = plainLen + CryptFS.BLOCK_OVERHEAD;
-            const onDiskOffset = this._blockDiskOffset(block);
 
-            const onDiskBuf = Buffer.alloc(onDiskLen);
-            // eslint-disable-next-line no-await-in-loop
-            const {bytesRead} = await fh.read(onDiskBuf, 0, onDiskLen, onDiskOffset);
+            const plain = this._decryptBlock(
+                block,
+                onDiskBuf.subarray(cursor, cursor + onDiskLen)
+            );
 
-            if (bytesRead < onDiskLen) {
-                throw new ErrnoFuseCb(Fuse.EIO, `CryptFS block ${block} truncated on disk`);
-            }
-
-            // eslint-disable-next-line no-await-in-loop
-            const plain = this._decryptBlock(block, onDiskBuf);
-
-            // copy the relevant slice of this plaintext block into the output
             const sliceStart = Math.max(offset, blockPlainStart) - blockPlainStart;
             const sliceEnd = Math.min(offset + toReadTotal, blockPlainStart + plainLen) - blockPlainStart;
 
             plain.copy(out, done, sliceStart, sliceEnd);
             done += sliceEnd - sliceStart;
+            cursor += onDiskLen;
         }
 
         return out;
@@ -582,8 +649,13 @@ export class CryptFS implements VirtualFSEntry {
         const { fh } = this._handler.getHandle(fd);
 
         if (fh) {
-            await fh.close();
-            this._handler.freeHandle(fd);
+            try {
+                await this._flushFileSizeIfDirty(fd, fh);
+            } finally {
+                await fh.close();
+                this._handler.freeHandle(fd);
+                this._metaCache.delete(fd);
+            }
         }
     }
 
@@ -661,6 +733,8 @@ export class CryptFS implements VirtualFSEntry {
         if (!fh) {
             throw new Error(`Filehandle not found: ${fd}`);
         }
+
+        await this._flushFileSizeIfDirty(fd, fh);
 
         if (datasync) {
             await fh.datasync();
@@ -741,10 +815,12 @@ export class CryptFS implements VirtualFSEntry {
      *
      * @param {fs.FileHandle} fh
      * @param {number} newSize
+     * @param {number} [knownOldSize] Pre-known old plaintext size to avoid
+     *   re-reading the header (e.g. from the per-fd cache in ftruncate).
      * @private
      */
-    private async _resize(fh: fs.FileHandle, newSize: number): Promise<void> {
-        const oldSize = await this._readHeader(fh);
+    private async _resize(fh: fs.FileHandle, newSize: number, knownOldSize?: number): Promise<void> {
+        const oldSize = knownOldSize ?? await this._readHeader(fh);
 
         if (newSize === oldSize) {
             return;
@@ -841,7 +917,17 @@ export class CryptFS implements VirtualFSEntry {
             throw new ErrnoFuseCb(Fuse.EINVAL);
         }
 
-        await this._resize(fh, size);
+        const oldSize = await this._getCachedFileSize(fd, fh);
+        await this._resize(fh, size, oldSize);
+
+        // _resize already persisted the new filesize to the header.
+        const entry = this._metaCache.get(fd);
+        if (entry) {
+            entry.fileSize = size;
+            entry.dirty = false;
+        } else {
+            this._metaCache.set(fd, {fileSize: size, dirty: false});
+        }
     }
 
     /**
@@ -862,7 +948,7 @@ export class CryptFS implements VirtualFSEntry {
         const writeLen = buffer.length;
         const writeEnd = offset + writeLen;
 
-        const fileSize = await this._readHeader(fh);
+        const fileSize = await this._getCachedFileSize(fd, fh);
         const oldNumBlocks = this._numBlocks(fileSize);
         const oldLastBlock = oldNumBlocks - 1;
         const oldLastPlainLen = oldLastBlock >= 0
@@ -892,31 +978,65 @@ export class CryptFS implements VirtualFSEntry {
         const lastAffected = Math.max(lastTouched, newLastBlock);
         let bytesWritten = 0;
 
+        // Identify the range of blocks whose existing ciphertext we still
+        // need (on-disk blocks that aren't fully overwritten). Coalesce
+        // them into a single fh.read; non-needed blocks inside the range
+        // are over-read but cost only bandwidth, not extra syscalls.
+        let firstReadBlock = -1;
+        let lastReadBlock = -1;
         for (let block = firstAffected; block <= lastAffected; block++) {
             const blockPlainStart = block * this._options.blockSize;
             const newBlockPlainLen = this._plainLenOfBlock(block, newFileSize);
+            const writeFullyCoversBlock =
+                offset <= blockPlainStart &&
+                writeEnd >= blockPlainStart + newBlockPlainLen;
 
-            // Existing plaintext for this block (zero-padded if it didn't
-            // exist yet, or read+verified from disk otherwise).
+            if (block < oldNumBlocks && !writeFullyCoversBlock) {
+                if (firstReadBlock < 0) {
+                    firstReadBlock = block;
+                }
+                lastReadBlock = block;
+            }
+        }
+
+        let readBuf: Buffer | null = null;
+        let readBufStart = 0;
+        if (firstReadBlock >= 0) {
+            readBufStart = this._blockDiskOffset(firstReadBlock);
+            const lastReadOnDiskLen =
+                this._plainLenOfBlock(lastReadBlock, fileSize) + CryptFS.BLOCK_OVERHEAD;
+            const readLen =
+                this._blockDiskOffset(lastReadBlock) + lastReadOnDiskLen - readBufStart;
+            readBuf = Buffer.alloc(readLen);
+            const {bytesRead} = await fh.read(readBuf, 0, readLen, readBufStart);
+            if (bytesRead < readLen) {
+                throw new ErrnoFuseCb(Fuse.EIO, 'CryptFS write RMW read truncated');
+            }
+        }
+
+        // Encrypt every affected block into a contiguous buffer.
+        const writeChunks: Buffer[] = [];
+
+        for (let block = firstAffected; block <= lastAffected; block++) {
+            const blockPlainStart = block * this._options.blockSize;
+            const newBlockPlainLen = this._plainLenOfBlock(block, newFileSize);
+            const writeFullyCoversBlock =
+                offset <= blockPlainStart &&
+                writeEnd >= blockPlainStart + newBlockPlainLen;
+
             let existing: Buffer;
-            if (block < oldNumBlocks) {
+            if (block < oldNumBlocks && !writeFullyCoversBlock) {
                 const existingOnDiskLen =
                     this._plainLenOfBlock(block, fileSize) + CryptFS.BLOCK_OVERHEAD;
-                const onDiskBuf = Buffer.alloc(existingOnDiskLen);
-                // eslint-disable-next-line no-await-in-loop
-                const {bytesRead} = await fh.read(
-                    onDiskBuf, 0, existingOnDiskLen, this._blockDiskOffset(block)
+                const bufOff = this._blockDiskOffset(block) - readBufStart;
+                existing = this._decryptBlock(
+                    block,
+                    readBuf!.subarray(bufOff, bufOff + existingOnDiskLen)
                 );
-                if (bytesRead < existingOnDiskLen) {
-                    throw new ErrnoFuseCb(Fuse.EIO, `CryptFS block ${block} truncated on disk`);
-                }
-                // eslint-disable-next-line no-await-in-loop
-                existing = this._decryptBlock(block, onDiskBuf);
             } else {
                 existing = Buffer.alloc(0);
             }
 
-            // Build the post-write plaintext for this block.
             const newPlain = Buffer.alloc(newBlockPlainLen);
             existing.copy(newPlain, 0, 0, Math.min(existing.length, newBlockPlainLen));
 
@@ -931,15 +1051,25 @@ export class CryptFS implements VirtualFSEntry {
                 bytesWritten += copyLen;
             }
 
-            const encrypted = this._encryptBlock(block, newPlain);
-            // eslint-disable-next-line no-await-in-loop
-            await fh.write(encrypted, 0, encrypted.length, this._blockDiskOffset(block));
+            writeChunks.push(this._encryptBlock(block, newPlain));
         }
 
-        // Header: only filesize changes, magic+version stay.
-        const sizeBuf = Buffer.alloc(8);
-        sizeBuf.writeBigInt64BE(BigInt(newFileSize), 0);
-        await fh.write(sizeBuf, 0, 8, CryptFS.HEADER_FILESIZE_OFFSET);
+        // Single coalesced write covering every affected block.
+        const writeBuf = Buffer.concat(writeChunks);
+        await fh.write(
+            writeBuf, 0, writeBuf.length, this._blockDiskOffset(firstAffected)
+        );
+
+        // Update the cached filesize; persist is deferred to release()/fsync().
+        if (newFileSize !== fileSize) {
+            const entry = this._metaCache.get(fd);
+            if (entry) {
+                entry.fileSize = newFileSize;
+                entry.dirty = true;
+            } else {
+                this._metaCache.set(fd, {fileSize: newFileSize, dirty: true});
+            }
+        }
 
         return bytesWritten;
     }
